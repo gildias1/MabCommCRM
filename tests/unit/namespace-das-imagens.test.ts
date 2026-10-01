@@ -10,6 +10,7 @@ import {
   donoConfiavelDoRunner,
   donoDo,
   NAMESPACE_DESTE_REPO,
+  NOME_DESTE_REPO,
 } from "./_identidade-deste-repo";
 
 /**
@@ -237,7 +238,7 @@ describe("o kit aponta para o que o CI realmente publica", () => {
     // SÓ aquele literal faria a âncora se calar contra o upstream. Derivando, o
     // mesmo commit fica vermelho AQUI, contra seis arquivos que ele não tocou.
     // Medido nos dois sentidos, com a URL fixa e com ela derivada (ver cabeçalho).
-    const repo = `https://github.com/${DONO_DESTE_REPO}/DeskcommCRM`;
+    const repo = `https://github.com/${DONO_DESTE_REPO}/${NOME_DESTE_REPO}`;
     for (const script of ["install.sh", "comecar.sh"]) {
       const texto = fs.readFileSync(path.join(RAIZ, "hostgator-setup-kit", script), "utf8");
       expect(texto).toContain(`REPO_URL="\${REPO_URL:-${repo}.git}"`);
