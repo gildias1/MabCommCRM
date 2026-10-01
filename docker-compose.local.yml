@@ -6,6 +6,11 @@
 # publicadas pelo Supabase local.
 #
 # Uso: bash scripts/local-stack.sh up
+#
+# Por padrão o app, o worker e o scheduler são CONSTRUÍDOS a partir desta
+# pasta (`pull_policy: never`). Com `LOCAL_IMAGES=publicadas`, o local-stack.sh
+# preenche LOCAL_*_IMAGE e LOCAL_PULL_POLICY com as imagens que o CI publicou
+# (namespace = IMG_NS do kit) — o que um cliente recebe, sem compilar nada.
 
 services:
   app:
@@ -14,8 +19,8 @@ services:
       dockerfile: Dockerfile
       args:
         APP_VERSION: ${APP_VERSION:-local}
-    image: deskcomm-app:local
-    pull_policy: never
+    image: ${LOCAL_APP_IMAGE:-deskcomm-app:local}
+    pull_policy: ${LOCAL_PULL_POLICY:-never}
     restart: unless-stopped
     env_file: ${LOCAL_ENV_FILE:-.env.local}
     environment:
@@ -42,8 +47,8 @@ services:
       dockerfile: Dockerfile.worker
       args:
         APP_VERSION: ${APP_VERSION:-local}
-    image: deskcomm-worker:local
-    pull_policy: never
+    image: ${LOCAL_WORKER_IMAGE:-deskcomm-worker:local}
+    pull_policy: ${LOCAL_PULL_POLICY:-never}
     restart: unless-stopped
     env_file: ${LOCAL_ENV_FILE:-.env.local}
     environment:
@@ -68,8 +73,8 @@ services:
       dockerfile: Dockerfile.scheduler
       args:
         APP_VERSION: ${APP_VERSION:-local}
-    image: deskcomm-scheduler:local
-    pull_policy: never
+    image: ${LOCAL_SCHEDULER_IMAGE:-deskcomm-scheduler:local}
+    pull_policy: ${LOCAL_PULL_POLICY:-never}
     restart: unless-stopped
     env_file: ${LOCAL_ENV_FILE:-.env.local}
     environment:

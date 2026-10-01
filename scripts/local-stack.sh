@@ -38,13 +38,40 @@ ensure_encryption_key() {
     >/dev/null
 }
 
+# LOCAL_IMAGES=publicadas troca a construção local pelas imagens que o CI
+# publicou: é o que um cliente recebe, e não exige memória para compilar.
+# O namespace sai do IMG_NS do kit — nunca de um literal aqui.
+usar_imagens_publicadas() {
+  case "${LOCAL_IMAGES:-}" in
+    "") return 1 ;;
+    publicadas) ;;
+    *)
+      printf 'Erro: LOCAL_IMAGES=%s não existe; use LOCAL_IMAGES=publicadas.\n' "$LOCAL_IMAGES" >&2
+      exit 2
+      ;;
+  esac
+  local ns tag="${LOCAL_IMAGES_TAG:-stable}"
+  ns="$(sed -n 's/^IMG_NS="\([^"]*\)"$/\1/p' hostgator-setup-kit/_common.sh)"
+  [[ -n "$ns" ]] || { printf 'Erro: não achei IMG_NS em hostgator-setup-kit/_common.sh.\n' >&2; exit 1; }
+  export LOCAL_APP_IMAGE="$ns/deskcommcrm:$tag"
+  export LOCAL_WORKER_IMAGE="$ns/deskcomm-worker:$tag"
+  export LOCAL_SCHEDULER_IMAGE="$ns/deskcomm-scheduler:$tag"
+  export LOCAL_PULL_POLICY=missing
+  printf 'Usando imagens publicadas: %s (tag %s)\n' "$ns" "$tag"
+}
+
 case "${1:-}" in
   up)
     ensure_supabase
     ./scripts/local-env.sh ensure
     require_env
     ensure_encryption_key
-    "${COMPOSE[@]}" up -d --build
+    if usar_imagens_publicadas; then
+      "${COMPOSE[@]}" pull app worker scheduler
+      "${COMPOSE[@]}" up -d --no-build
+    else
+      "${COMPOSE[@]}" up -d --build
+    fi
     ;;
   down)
     "${COMPOSE[@]}" down
@@ -71,6 +98,7 @@ case "${1:-}" in
     "${COMPOSE[@]}" down
     ./scripts/local-supabase.sh stop
     ./scripts/local-supabase.sh start
+    usar_imagens_publicadas || true
     "${COMPOSE[@]}" up -d
     ;;
   *)
