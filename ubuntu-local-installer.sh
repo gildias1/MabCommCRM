@@ -38,7 +38,7 @@ fi
 if [ ! -f "package.json" ]; then
   step "Clonando o repositório DeskcommCRM..."
   git clone https://github.com/gildias1/MabCommCRM.git
-  cd DeskcommCRM
+  cd MabCommCRM
 fi
 
 if ! command -v pnpm >/dev/null 2>&1; then

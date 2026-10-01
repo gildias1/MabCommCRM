@@ -131,6 +131,59 @@ check "ambiente da NUVEM é copiado antes de ser substituído" test -s "$TMP_DIR
 ) >/dev/null 2>&1
 check "ambiente JÁ local não vira backup a cada run" bash -c '! test -e "$1/.env.local.cloud-backup"' _ "$TMP_DIR"
 
+# ── Construir ou usar as imagens publicadas ────────────────────────────────
+#
+# O padrão continua sendo construir desta pasta. `LOCAL_IMAGES=publicadas`
+# troca pelas imagens do CI, com o namespace tirado do IMG_NS do kit. As
+# checagens EXECUTAM a função extraída do script, numa raiz de mentira.
+check "por padrão o up constrói desta pasta" grep -qF 'up -d --build' "$STACK"
+check "o compose segue construindo quando nada é pedido" bash -c '
+  grep -qF "image: \${LOCAL_APP_IMAGE:-deskcomm-app:local}" "$1" &&
+  grep -qF "pull_policy: \${LOCAL_PULL_POLICY:-never}" "$1"' _ "$COMPOSE"
+funcao_imagens() {
+  awk '/^usar_imagens_publicadas\(\) \{/,/^\}$/' "$STACK"
+}
+[[ -n "$(funcao_imagens)" ]] || { printf '  ✗ não achei usar_imagens_publicadas no local-stack.sh\n'; FAILS=$((FAILS + 1)); }
+mkdir -p "$TMP_DIR/raiz/hostgator-setup-kit"
+printf 'IMG_NS="ghcr.io/dono-de-teste"\n' > "$TMP_DIR/raiz/hostgator-setup-kit/_common.sh"
+check "LOCAL_IMAGES=publicadas aponta para o IMG_NS do kit" bash -c '
+  cd "$1" && eval "$2"
+  LOCAL_IMAGES=publicadas usar_imagens_publicadas >/dev/null &&
+  [[ "$LOCAL_APP_IMAGE" == "ghcr.io/dono-de-teste/deskcommcrm:stable" ]] &&
+  [[ "$LOCAL_SCHEDULER_IMAGE" == "ghcr.io/dono-de-teste/deskcomm-scheduler:stable" ]] &&
+  [[ "$LOCAL_PULL_POLICY" == "missing" ]]' _ "$TMP_DIR/raiz" "$(funcao_imagens)"
+check "LOCAL_IMAGES_TAG escolhe a versão" bash -c '
+  cd "$1" && eval "$2"
+  LOCAL_IMAGES=publicadas LOCAL_IMAGES_TAG=1.69.1 usar_imagens_publicadas >/dev/null &&
+  [[ "$LOCAL_WORKER_IMAGE" == "ghcr.io/dono-de-teste/deskcomm-worker:1.69.1" ]]' _ "$TMP_DIR/raiz" "$(funcao_imagens)"
+check "sem LOCAL_IMAGES nada muda (continua construindo)" bash -c '
+  cd "$1" && eval "$2"
+  unset LOCAL_IMAGES; ! usar_imagens_publicadas' _ "$TMP_DIR/raiz" "$(funcao_imagens)"
+check "valor desconhecido em LOCAL_IMAGES é recusado" bash -c '
+  cd "$1" && eval "$2"
+  ( LOCAL_IMAGES=nuvem usar_imagens_publicadas ) 2>/dev/null; [[ $? -eq 2 ]]' _ "$TMP_DIR/raiz" "$(funcao_imagens)"
+
+# ── O banco visto de dentro do Docker ──────────────────────────────────────
+#
+# Medido no Docker Desktop (WSL2): o worker reiniciava em ciclo com
+# `connect EHOSTUNREACH <IP da VM>:54322`, porque o .env.local aponta o banco
+# para o IP da VM e a VM do Docker Desktop não o alcança.
+funcao_banco() {
+  awk '/^banco_visto_de_dentro_do_docker\(\) \{/,/^\}$/' "$STACK"
+}
+[[ -n "$(funcao_banco)" ]] || { printf '  ✗ não achei banco_visto_de_dentro_do_docker no local-stack.sh\n'; FAILS=$((FAILS + 1)); }
+check "o banco dos contêineres troca o IP da VM por host.docker.internal" bash -c '
+  printf "SUPABASE_DB_URL=postgresql://postgres:postgres@172.19.118.200:54322/postgres\n" > "$1/env-banco"
+  ENV_FILE="$1/env-banco"; eval "$2"; banco_visto_de_dentro_do_docker
+  [[ "$LOCAL_CONTAINER_DB_URL" == "postgresql://postgres:postgres@host.docker.internal:54322/postgres" ]]' _ "$TMP_DIR" "$(funcao_banco)"
+check "sem SUPABASE_DB_URL a função não inventa endereço" bash -c '
+  : > "$1/env-vazio"; unset LOCAL_CONTAINER_DB_URL
+  ENV_FILE="$1/env-vazio"; eval "$2"; banco_visto_de_dentro_do_docker
+  [[ -z "${LOCAL_CONTAINER_DB_URL:-}" ]]' _ "$TMP_DIR" "$(funcao_banco)"
+check "app, worker e scheduler recebem o banco visto de dentro" bash -c '
+  [[ "$(grep -c "SUPABASE_DB_URL: \${LOCAL_CONTAINER_DB_URL:-" "$1")" == 3 ]] &&
+  [[ "$(grep -c "SUPABASE_SERVER_URL: \${SUPABASE_SERVER_URL:-http://host.docker.internal:54321}" "$1")" == 3 ]]' _ "$COMPOSE"
+
 if [[ "$FAILS" -gt 0 ]]; then
   printf '\n%s verificação(ões) falharam\n' "$FAILS"
   exit 1
