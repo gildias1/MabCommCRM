@@ -25,6 +25,14 @@ services:
     env_file: ${LOCAL_ENV_FILE:-.env.local}
     environment:
       WAHA_API_BASE_URL: http://waha:3000
+      # De dentro do contêiner, o IP da VM (que o .env.local usa para o
+      # navegador e os scripts do host) é inalcançável no Docker Desktop, que
+      # roda numa VM à parte. host.docker.internal chega ao host nos dois
+      # cenários; o local-stack.sh monta LOCAL_CONTAINER_DB_URL a partir do
+      # SUPABASE_DB_URL do .env.local.
+      SUPABASE_SERVER_URL: ${SUPABASE_SERVER_URL:-http://host.docker.internal:54321}
+      SUPABASE_DB_URL: ${LOCAL_CONTAINER_DB_URL:-${SUPABASE_DB_URL:-}}
+      SUPABASE_DB_ADMIN_URL: ${LOCAL_CONTAINER_DB_URL:-${SUPABASE_DB_ADMIN_URL:-}}
     ports:
       - "${APP_PORT:-3000}:3000"
     extra_hosts:
@@ -53,6 +61,10 @@ services:
     env_file: ${LOCAL_ENV_FILE:-.env.local}
     environment:
       WAHA_API_BASE_URL: http://waha:3000
+      # Ver o comentário no serviço app.
+      SUPABASE_SERVER_URL: ${SUPABASE_SERVER_URL:-http://host.docker.internal:54321}
+      SUPABASE_DB_URL: ${LOCAL_CONTAINER_DB_URL:-${SUPABASE_DB_URL:-}}
+      SUPABASE_DB_ADMIN_URL: ${LOCAL_CONTAINER_DB_URL:-${SUPABASE_DB_ADMIN_URL:-}}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -79,6 +91,10 @@ services:
     env_file: ${LOCAL_ENV_FILE:-.env.local}
     environment:
       TZ: UTC
+      # Ver o comentário no serviço app.
+      SUPABASE_SERVER_URL: ${SUPABASE_SERVER_URL:-http://host.docker.internal:54321}
+      SUPABASE_DB_URL: ${LOCAL_CONTAINER_DB_URL:-${SUPABASE_DB_URL:-}}
+      SUPABASE_DB_ADMIN_URL: ${LOCAL_CONTAINER_DB_URL:-${SUPABASE_DB_ADMIN_URL:-}}
       # Os crons autenticam com INTERNAL_CRON_SECRET quando definido; o app
       # aplica a mesma prioridade. Sem este fallback, o scheduler enviava
       # INTERNAL_SECRET e recebia 401 em instalações com os dois segredos.

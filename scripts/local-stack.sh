@@ -38,6 +38,18 @@ ensure_encryption_key() {
     >/dev/null
 }
 
+# O .env.local aponta o banco para o IP da VM: é o que os scripts do host e o
+# navegador alcançam. De dentro dos contêineres esse IP é inalcançável no
+# Docker Desktop (VM à parte, EHOSTUNREACH), e host.docker.internal chega ao
+# host nos dois cenários. O compose usa LOCAL_CONTAINER_DB_URL quando existe.
+banco_visto_de_dentro_do_docker() {
+  local url
+  url="$(awk -F= '$1 == "SUPABASE_DB_URL" { sub(/^[^=]*=/, ""); print; exit }' "$ENV_FILE")"
+  [[ -n "$url" ]] || return 0
+  LOCAL_CONTAINER_DB_URL="$(printf '%s' "$url" | sed -E 's#@[^:/@]+(:[0-9]+)?/#@host.docker.internal\1/#')"
+  export LOCAL_CONTAINER_DB_URL
+}
+
 # LOCAL_IMAGES=publicadas troca a construção local pelas imagens que o CI
 # publicou: é o que um cliente recebe, e não exige memória para compilar.
 # O namespace sai do IMG_NS do kit — nunca de um literal aqui.
@@ -66,6 +78,7 @@ case "${1:-}" in
     ./scripts/local-env.sh ensure
     require_env
     ensure_encryption_key
+    banco_visto_de_dentro_do_docker
     if usar_imagens_publicadas; then
       "${COMPOSE[@]}" pull app worker scheduler
       "${COMPOSE[@]}" up -d --no-build
@@ -99,6 +112,7 @@ case "${1:-}" in
     ./scripts/local-supabase.sh stop
     ./scripts/local-supabase.sh start
     usar_imagens_publicadas || true
+    banco_visto_de_dentro_do_docker
     "${COMPOSE[@]}" up -d
     ;;
   *)

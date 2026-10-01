@@ -163,6 +163,27 @@ check "valor desconhecido em LOCAL_IMAGES é recusado" bash -c '
   cd "$1" && eval "$2"
   ( LOCAL_IMAGES=nuvem usar_imagens_publicadas ) 2>/dev/null; [[ $? -eq 2 ]]' _ "$TMP_DIR/raiz" "$(funcao_imagens)"
 
+# ── O banco visto de dentro do Docker ──────────────────────────────────────
+#
+# Medido no Docker Desktop (WSL2): o worker reiniciava em ciclo com
+# `connect EHOSTUNREACH <IP da VM>:54322`, porque o .env.local aponta o banco
+# para o IP da VM e a VM do Docker Desktop não o alcança.
+funcao_banco() {
+  awk '/^banco_visto_de_dentro_do_docker\(\) \{/,/^\}$/' "$STACK"
+}
+[[ -n "$(funcao_banco)" ]] || { printf '  ✗ não achei banco_visto_de_dentro_do_docker no local-stack.sh\n'; FAILS=$((FAILS + 1)); }
+check "o banco dos contêineres troca o IP da VM por host.docker.internal" bash -c '
+  printf "SUPABASE_DB_URL=postgresql://postgres:postgres@172.19.118.200:54322/postgres\n" > "$1/env-banco"
+  ENV_FILE="$1/env-banco"; eval "$2"; banco_visto_de_dentro_do_docker
+  [[ "$LOCAL_CONTAINER_DB_URL" == "postgresql://postgres:postgres@host.docker.internal:54322/postgres" ]]' _ "$TMP_DIR" "$(funcao_banco)"
+check "sem SUPABASE_DB_URL a função não inventa endereço" bash -c '
+  : > "$1/env-vazio"; unset LOCAL_CONTAINER_DB_URL
+  ENV_FILE="$1/env-vazio"; eval "$2"; banco_visto_de_dentro_do_docker
+  [[ -z "${LOCAL_CONTAINER_DB_URL:-}" ]]' _ "$TMP_DIR" "$(funcao_banco)"
+check "app, worker e scheduler recebem o banco visto de dentro" bash -c '
+  [[ "$(grep -c "SUPABASE_DB_URL: \${LOCAL_CONTAINER_DB_URL:-" "$1")" == 3 ]] &&
+  [[ "$(grep -c "SUPABASE_SERVER_URL: \${SUPABASE_SERVER_URL:-http://host.docker.internal:54321}" "$1")" == 3 ]]' _ "$COMPOSE"
+
 if [[ "$FAILS" -gt 0 ]]; then
   printf '\n%s verificação(ões) falharam\n' "$FAILS"
   exit 1
