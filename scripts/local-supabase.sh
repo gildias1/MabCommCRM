@@ -4,7 +4,8 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-cli() { npx --yes supabase "$@"; }
+# Versão fixa: a 3.x recusa o [inbucket] do config.toml e impede o laboratório de subir.
+cli() { npx --yes supabase@2.122.1 "$@"; }
 
 json_value() {
   local key="$1"
