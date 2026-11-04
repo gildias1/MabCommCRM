@@ -62,6 +62,10 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      # Padrões da versão Mab Comm: quem define estas chaves no .env continua mandando.
+      APP_NAME: ${APP_NAME:-Mab Comm}
+      APP_ACCENT_HEX: "${APP_ACCENT_HEX:-#262626}"
+      SENTRY_DSN: ${SENTRY_DSN-off}
       SUPABASE_DB_ADMIN_URL: ""
       # O `worker` deste arquivo drena o event_log em poucos segundos (2 s com
       # fila, até 10 s parado); o webhook de mensagem não precisa mais drenar a
@@ -179,6 +183,10 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      # Padrões da versão Mab Comm: quem define estas chaves no .env continua mandando.
+      APP_NAME: ${APP_NAME:-Mab Comm}
+      APP_ACCENT_HEX: "${APP_ACCENT_HEX:-#262626}"
+      SENTRY_DSN: ${SENTRY_DSN-off}
       # dentro da rede do compose, o WAHA é o serviço 'waha' na porta interna 3000
       WAHA_API_BASE_URL: http://waha:3000
       SUPABASE_DB_ADMIN_URL: ""
@@ -486,6 +494,10 @@ services:
     # da aplicação no import, não só as de voz.
     env_file: .env
     environment:
+      # Padrões da versão Mab Comm: quem define estas chaves no .env continua mandando.
+      APP_NAME: ${APP_NAME:-Mab Comm}
+      APP_ACCENT_HEX: "${APP_ACCENT_HEX:-#262626}"
+      SENTRY_DSN: ${SENTRY_DSN-off}
       ARI_URL: "http://asterisk:8088"
       ARI_WS_URL: "ws://asterisk:8088/ari/events"
       ARI_APP: "voice-agent"

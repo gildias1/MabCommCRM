@@ -154,7 +154,7 @@ INTERNAL_CRON_SECRET=$INTERNAL_SEC
 LGPD_SIGNING_KEY=$INTERNAL_SEC
 APP_PORT=$APP_PORT
 
-SENTRY_DSN=
+SENTRY_DSN=off
 EOF
 
 step "Subindo os serviços do DeskcommCRM (App, Worker, WAHA, Redis)..."

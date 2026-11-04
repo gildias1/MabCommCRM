@@ -180,7 +180,7 @@ APP_URL="${NEXT_PUBLIC_APP_URL:-}"
 ACCENT="${APP_ACCENT_HEX:-}"
 case "$ACCENT" in
   \#[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
-  *) ACCENT="#506d48";;
+  *) ACCENT="#262626";;
 esac
 
 # A frente do botão: preto ou branco, pela luminância relativa da cor de fundo.

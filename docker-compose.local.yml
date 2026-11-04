@@ -24,6 +24,10 @@ services:
     restart: unless-stopped
     env_file: ${LOCAL_ENV_FILE:-.env.local}
     environment:
+      # Padrões da versão Mab Comm: quem define estas chaves no .env continua mandando.
+      APP_NAME: ${APP_NAME:-Mab Comm}
+      APP_ACCENT_HEX: "${APP_ACCENT_HEX:-#262626}"
+      SENTRY_DSN: ${SENTRY_DSN-off}
       WAHA_API_BASE_URL: http://waha:3000
       # De dentro do contêiner, o IP da VM (que o .env.local usa para o
       # navegador e os scripts do host) é inalcançável no Docker Desktop, que
@@ -62,6 +66,10 @@ services:
     restart: unless-stopped
     env_file: ${LOCAL_ENV_FILE:-.env.local}
     environment:
+      # Padrões da versão Mab Comm: quem define estas chaves no .env continua mandando.
+      APP_NAME: ${APP_NAME:-Mab Comm}
+      APP_ACCENT_HEX: "${APP_ACCENT_HEX:-#262626}"
+      SENTRY_DSN: ${SENTRY_DSN-off}
       WAHA_API_BASE_URL: http://waha:3000
       # Ver o comentário no serviço app.
       SUPABASE_SERVER_URL: ${SUPABASE_SERVER_URL:-http://host.docker.internal:54321}
@@ -97,6 +105,10 @@ services:
     restart: unless-stopped
     env_file: ${LOCAL_ENV_FILE:-.env.local}
     environment:
+      # Padrões da versão Mab Comm: quem define estas chaves no .env continua mandando.
+      APP_NAME: ${APP_NAME:-Mab Comm}
+      APP_ACCENT_HEX: "${APP_ACCENT_HEX:-#262626}"
+      SENTRY_DSN: ${SENTRY_DSN-off}
       TZ: UTC
       # Ver o comentário no serviço app.
       SUPABASE_SERVER_URL: ${SUPABASE_SERVER_URL:-http://host.docker.internal:54321}
