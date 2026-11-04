@@ -55,6 +55,9 @@ pois a aplicação precisa ser recriada e recompilada para carregar as novas
 variáveis. `docker compose restart` sozinho não atualiza o ambiente do
 container.
 
+Se a porta 8787 da sua máquina já estiver em uso por outro programa, o `worker`
+não sobe. Escolha outra porta com `LOCAL_WORKER_PORT=8788` no `.env.local`.
+
 O endereço e a porta são mostrados ao final do instalador. Se a porta 3000 já
 estiver ocupada, ele escolhe a próxima porta livre. O painel local do Supabase
 fica em `http://127.0.0.1:54323` e o WAHA em `http://127.0.0.1:3030`.
