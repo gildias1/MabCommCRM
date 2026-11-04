@@ -151,11 +151,14 @@ check "LOCAL_IMAGES=publicadas aponta para o IMG_NS do kit" bash -c '
   LOCAL_IMAGES=publicadas usar_imagens_publicadas >/dev/null &&
   [[ "$LOCAL_APP_IMAGE" == "ghcr.io/dono-de-teste/deskcommcrm:stable" ]] &&
   [[ "$LOCAL_SCHEDULER_IMAGE" == "ghcr.io/dono-de-teste/deskcomm-scheduler:stable" ]] &&
-  [[ "$LOCAL_PULL_POLICY" == "missing" ]]' _ "$TMP_DIR/raiz" "$(funcao_imagens)"
-check "LOCAL_IMAGES_TAG escolhe a versão" bash -c '
+  [[ "$LOCAL_PULL_POLICY" == "always" ]]' _ "$TMP_DIR/raiz" "$(funcao_imagens)"
+check "LOCAL_IMAGES_TAG escolhe a versão, e versão fixa não baixa de novo" bash -c '
   cd "$1" && eval "$2"
   LOCAL_IMAGES=publicadas LOCAL_IMAGES_TAG=1.69.1 usar_imagens_publicadas >/dev/null &&
-  [[ "$LOCAL_WORKER_IMAGE" == "ghcr.io/dono-de-teste/deskcomm-worker:1.69.1" ]]' _ "$TMP_DIR/raiz" "$(funcao_imagens)"
+  [[ "$LOCAL_WORKER_IMAGE" == "ghcr.io/dono-de-teste/deskcomm-worker:1.69.1" ]] &&
+  [[ "$LOCAL_PULL_POLICY" == "missing" ]]' _ "$TMP_DIR/raiz" "$(funcao_imagens)"
+check "a porta do worker pode mudar sem mudar a de dentro" \
+  grep -qF '"127.0.0.1:${LOCAL_WORKER_PORT:-8787}:8787"' "$COMPOSE"
 check "sem LOCAL_IMAGES nada muda (continua construindo)" bash -c '
   cd "$1" && eval "$2"
   unset LOCAL_IMAGES; ! usar_imagens_publicadas' _ "$TMP_DIR/raiz" "$(funcao_imagens)"

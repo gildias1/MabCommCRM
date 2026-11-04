@@ -68,7 +68,12 @@ usar_imagens_publicadas() {
   export LOCAL_APP_IMAGE="$ns/deskcommcrm:$tag"
   export LOCAL_WORKER_IMAGE="$ns/deskcomm-worker:$tag"
   export LOCAL_SCHEDULER_IMAGE="$ns/deskcomm-scheduler:$tag"
-  export LOCAL_PULL_POLICY=missing
+  # A política acompanha a mutabilidade da tag. Com `missing` numa tag móvel, o
+  # `compose pull` pula a imagem já presente e o laboratório fica na versão antiga.
+  case "$tag" in
+    stable | latest | main) export LOCAL_PULL_POLICY=always ;;
+    *) export LOCAL_PULL_POLICY=missing ;;
+  esac
   printf 'Usando imagens publicadas: %s (tag %s)\n' "$ns" "$tag"
 }
 
