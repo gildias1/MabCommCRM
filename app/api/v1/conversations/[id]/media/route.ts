@@ -6,9 +6,10 @@ import { requireSupportWrite } from "@/lib/impersonate/support";
  */
 import { randomUUID } from "node:crypto";
 import { type NextRequest } from "next/server";
+import { z } from "zod";
 
 import { fail, ok } from "@/lib/api/wrappers";
-import { resolveAuthDual } from "@/lib/api/auth-dual";
+import { resolveAuthDual, tetoDeEscritaDoToken } from "@/lib/api/auth-dual";
 import { IDIOMA_PADRAO } from "@/lib/i18n/idiomas";
 import { extFromMime, MAX_MEDIA_BYTES } from "@/lib/messaging/media/types";
 import { validateOutboundMedia } from "@/lib/messaging/media/upload-validation";
@@ -43,6 +44,12 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
     scope: "mcp:write",
   });
   if (!authz.ok) return authz.response;
+  // Rota que aceita Bearer (PUBLIC_PATHS): o que não for contado aqui não é
+  // contado em lugar nenhum — mesmo teto das irmãs que já aplicam sobre
+  // resolveAuthDual. Upstream de mídia é exatamente o tipo de escrita em laço
+  // que o teto existe para conter (cada upload sobe arquivo de até 50 MB).
+  const teto = await tetoDeEscritaDoToken(authz, "conversation_media", requestId);
+  if (teto) return teto;
   // O ramo do token não carrega idioma de usuário: cai no padrão do produto.
   const t = (texto: string) => traduzir(texto, authz.idioma ?? IDIOMA_PADRAO);
   const activeOrg = { orgId: authz.organizationId };
@@ -84,6 +91,14 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
     return fail(verdict.code, verdict.message, status, { requestId });
   }
 
+  // A marca do gravador do composer (F2): "isto é nota de voz". Só com ela o
+  // AAC do iPhone vira opus — sem ela, um m4a enviado por token segue intacto.
+  const marca = z.literal("1").nullable().safeParse(form?.get("nota_de_voz") ?? null);
+  if (!marca.success) {
+    return fail("validation_failed", t("Campo 'nota_de_voz' inválido."), 422, { requestId });
+  }
+  const notaDeVoz = marca.data === "1";
+
   const bruto = Buffer.from(await file.arrayBuffer());
 
   // Nota de voz gravada no browser sai em `webm` (o Chrome não grava ogg), e o
@@ -92,7 +107,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
   // receber um arquivo válido, e o mesmo áudio poder ser reenviado depois sem
   // repetir o trabalho. Falha devolve o original: o canal que converte sozinho
   // continua funcionando como sempre.
-  const audio = await transcodificarNotaDeVoz({ buffer: bruto, mime });
+  const audio = await transcodificarNotaDeVoz({ buffer: bruto, mime, notaDeVoz });
   const mimeFinal = audio.mime;
   const buffer = audio.buffer;
 

@@ -283,6 +283,7 @@ const WHIN_SOURCE_INACTIVE = "dddddddd-5555-4000-8000-000000000003";
 const WHIN_SOURCE_SECRET = "dddddddd-5555-4000-8000-000000000004";
 const WHIN_SOURCE_RESPONDI = "dddddddd-5555-4000-8000-000000000005";
 const WHIN_SOURCE_RDSTATION = "dddddddd-5555-4000-8000-000000000006";
+const WHIN_SOURCE_ELEMENTOR = "dddddddd-5555-4000-8000-000000000007";
 // Fixture própria (namespace ffffffff, mesmo padrão de webhooks-rls.test.ts) —
 // org B só pra provar que o fallback por e-mail não cruza tenant.
 const WHIN_ORG_B = "ffffffff-0000-4000-8000-000000000101";
@@ -302,6 +303,7 @@ const TOKEN_SECRET = "wh-in-secret-token-1234";
 const TOKEN_UNKNOWN = "wh-in-does-not-exist-1234";
 const TOKEN_RESPONDI = "wh-in-respondi-token-1234";
 const TOKEN_RDSTATION = "wh-in-rdstation-token-1234";
+const TOKEN_ELEMENTOR = "wh-in-elementor-token-1234";
 
 /** Fixture sanitizada — mesma FORMA do payload real do Respondi (webhook_events_log, 2026-08-25). */
 const RESPONDI_FIXTURE = JSON.parse(
@@ -387,6 +389,10 @@ beforeAll(() => {
     insert into public.webhook_sources
       (id, organization_id, name, path_token, default_pipeline_id, default_stage_id)
       values ('${WHIN_SOURCE_RDSTATION_B}', '${WHIN_ORG_B}', 'RD Station Org B', '${TOKEN_RDSTATION_B}', '${WHIN_PIPELINE_B}', '${WHIN_STAGE_B}')
+      on conflict do nothing;
+    insert into public.webhook_sources
+      (id, organization_id, name, path_token, default_pipeline_id, default_stage_id)
+      values ('${WHIN_SOURCE_ELEMENTOR}', '${GOV_ORG}', 'Elementor Pro (fixture)', '${TOKEN_ELEMENTOR}', '${GOV_PIPELINE}', '${GOV_STAGE}')
       on conflict do nothing;
   `);
 });
@@ -542,6 +548,62 @@ describe("POST /api/v1/webhooks/in/[token] (Task 6)", () => {
     // síncrono. Este caso cobre a mesma lógica de re-seleção
     // (selectActiveByPhone) que o branch do catch usa; o branch do catch em
     // si (insertErr.code === "23505") fica sem cobertura direta de teste.
+  });
+
+  it("caso 8 — só nome e e-mail: cria o contato (sem telefone) e liga o card a ele (#3719)", async () => {
+    // O bloco de contato da rota existia só dentro de `if (mapped.phone)`. Um
+    // formulário de isca — material, newsletter, e-book — mandava nome e e-mail,
+    // o card entrava no funil com `contact_id = null` e a pessoa não aparecia em
+    // Contatos.
+    const email = "isca.sem.telefone@example.com";
+    const res = await POST(jsonReq(TOKEN_JSON, { nome: "Isca Sem Telefone", email }), reqCtx(TOKEN_JSON));
+    expect(res.status).toBe(200);
+    const leadId = ((await res.json()) as { data: { lead_id: string } }).data.lead_id;
+
+    const lead = rows(`select * from public.crm_leads where id = '${leadId}'`)[0]!;
+    expect(lead.contact_id, "o card nasceu sem contato").not.toBeNull();
+
+    const contato = rows(`select * from public.contacts where id = '${lead.contact_id}'`)[0]!;
+    expect(contato.organization_id).toBe(GOV_ORG);
+    expect(contato.name).toBe("Isca Sem Telefone");
+    expect(contato.email_normalized).toBe(email);
+    expect(contato.phone_number).toBeNull();
+    expect(contato.source).toBe("webhook");
+  });
+
+  it("caso 9 — telefone que chega DEPOIS com o mesmo e-mail: completa o contato e emite contact.phone_added (#3719)", async () => {
+    // O defeito mais caro: o INSERT colidia em `uniq_contacts_org_email`, o
+    // vencedor era achado pelo e-mail e o telefone do envio era DESCARTADO — o
+    // card ficava num contato sem número e o WhatsApp parava para esse lead.
+    const email = "completa.telefone@example.com";
+    const telefone = "+5511977770042";
+    const preexistente = "dddddddd-8888-4000-8000-000000000001";
+    sql(`
+      insert into public.contacts (id, organization_id, name, email, source)
+      values ('${preexistente}', '${GOV_ORG}', 'Completa Telefone', '${email}', 'manual')
+      on conflict do nothing;
+    `);
+
+    const res = await POST(
+      jsonReq(TOKEN_JSON, { nome: "Completa Telefone", email, telefone }),
+      reqCtx(TOKEN_JSON),
+    );
+    expect(res.status).toBe(200);
+    const leadId = ((await res.json()) as { data: { lead_id: string } }).data.lead_id;
+
+    const lead = rows(`select * from public.crm_leads where id = '${leadId}'`)[0]!;
+    expect(lead.contact_id, "criou um segundo contato em vez de completar o existente").toBe(preexistente);
+
+    const contato = rows(`select * from public.contacts where id = '${preexistente}'`)[0]!;
+    expect(contato.phone_number, "o telefone do envio foi descartado").toBe(telefone);
+
+    // A transição que as regras com o gatilho esperam — emitida DEPOIS da
+    // gravação, com o número já no contato.
+    const eventos = rows(
+      `select * from public.event_log where event_type = 'contact.phone_added' and entity_id = '${preexistente}'`,
+    );
+    expect(eventos.length, "a transição não foi anunciada").toBe(1);
+    expect((eventos[0]!.payload as Record<string, unknown>).phone_number).toBe(telefone);
   });
 
   // ponytail: rate limit cai no fallback in-memory sem Upstash (sem env
@@ -1254,7 +1316,7 @@ describe("POST /api/v1/webhooks/in/[token] — RD Station (envelope leads[])", (
     expect(lead.external_id).toBe("rdstation:lead:5035999003");
   });
 
-  it("rd 4 — nome + email e SEM telefone em lugar nenhum: ainda cria lead (regra atual)", async () => {
+  it("rd 4 — nome + email e SEM telefone em lugar nenhum: cria o contato só com e-mail e liga o card (#3719)", async () => {
     const payload = rdStationEnvelope({
       eventUuid: "aaaa0004-0000-4000-8000-000000000004",
       leadId: "5035999004",
@@ -1266,7 +1328,16 @@ describe("POST /api/v1/webhooks/in/[token] — RD Station (envelope leads[])", (
     const leadId = ((await res.json()) as { data: { lead_id: string } }).data.lead_id;
     const lead = rows(`select * from public.crm_leads where id = '${leadId}'`)[0]!;
     expect(lead.title).toBe("Maria RD");
-    expect(lead.contact_id).toBeNull(); // sem telefone → contato não é criado (mesma regra do genérico)
+    // A regra ANTIGA era "sem telefone → contato não é criado". A #3719 mudou
+    // isso: o e-mail também identifica contato, então o card nasce com vínculo
+    // mesmo quando o envio não traz número — achando o contato pelo
+    // `email_normalized` ou criando um só com e-mail.
+    expect(lead.contact_id, "o card nasceu sem contato").not.toBeNull();
+    const contato = rows(`select * from public.contacts where id = '${lead.contact_id}'`)[0]!;
+    // O contato pode ser o que um caso ANTERIOR desta suíte já criou para este
+    // e-mail (rd 1 manda o mesmo `maria.rd@example.com`) — o que este caso mede
+    // é o VÍNCULO que antes não existia, não o estado da ficha.
+    expect(contato.email_normalized).toBe("maria.rd@example.com");
   });
 
   it("rd 5 — sem identidade nenhuma (nome/email/telefone ausentes): 400 invalid_request, sem lead", async () => {
@@ -1342,5 +1413,82 @@ describe("POST /api/v1/webhooks/in/[token] — RD Station (envelope leads[])", (
     const lead = rows(`select currency, organization_id from public.crm_leads where id = '${data.lead_id}'`)[0]!;
     expect(lead.organization_id).toBe(org);
     expect(lead.currency).toBe("EUR");
+  });
+});
+
+/**
+ * POST /api/v1/webhooks/in/[token] — Elementor Pro (`fields[<id>][value]`, PR #2051).
+ *
+ * O Elementor manda form-urlencoded com colchetes, uma linha por propriedade de
+ * cada campo, e nenhuma chave de topo se chama `nome`: o genérico devolvia 400
+ * "Nenhum campo mapeável". O mapeador (`lib/webhooks/elementor.ts`) tem teste
+ * próprio; este bloco guarda a ROTA — a precedência `elementorMapped ??`, que
+ * um merge pode apagar sem conflito e sem nenhum outro teste reclamar.
+ */
+function elementorForm(over: Record<string, string> = {}): string {
+  return new URLSearchParams({
+    "form[id]": "57e8a20",
+    "form[name]": "form conversao",
+    "fields[name][id]": "name",
+    "fields[name][type]": "text",
+    "fields[name][title]": "Nome",
+    "fields[name][value]": "Maria Elementor",
+    "fields[name][required]": "1",
+    "fields[email][id]": "email",
+    "fields[email][type]": "email",
+    "fields[email][title]": "E-mail",
+    "fields[email][value]": "maria.elementor@example.com",
+    "fields[Telefone][id]": "Telefone",
+    "fields[Telefone][type]": "tel",
+    "fields[Telefone][title]": "Telefone",
+    "fields[Telefone][value]": "11955550071",
+    "fields[servico][id]": "servico",
+    "fields[servico][type]": "select",
+    "fields[servico][title]": "Selecione o serviço você precisa",
+    "fields[servico][value]": "projeto_customizado",
+    ...over,
+  }).toString();
+}
+
+describe("POST /api/v1/webhooks/in/[token] — Elementor Pro (fields[id][value])", () => {
+  it("elementor 1 — envio real: cria contato + lead na org da FONTE, identidade e campos extras dos colchetes", async () => {
+    const res = await POST(formReq(TOKEN_ELEMENTOR, elementorForm()), reqCtx(TOKEN_ELEMENTOR));
+    expect(res.status).toBe(200);
+    const leadId = ((await res.json()) as { data: { lead_id: string } }).data.lead_id;
+
+    const lead = rows(`select * from public.crm_leads where id = '${leadId}'`)[0]!;
+    expect(lead.organization_id).toBe(GOV_ORG);
+    expect(lead.source).toBe("webhook");
+    expect(lead.title).toBe("Maria Elementor");
+    const cf = lead.custom_fields as Record<string, unknown>;
+    expect(cf.servico).toBe("projeto_customizado");
+    expect(cf.elementor_form_id).toBe("57e8a20");
+    // As chaves cruas dos colchetes não vazam para o lead.
+    expect(Object.keys(cf).some((k) => k.startsWith("fields["))).toBe(false);
+
+    const contact = rows(`select * from public.contacts where id = '${lead.contact_id}'`)[0]!;
+    expect(contact.phone_number).toBe("+5511955550071");
+    expect(contact.email).toBe("maria.elementor@example.com");
+  });
+
+  it("elementor 2 — form-urlencoded plano com campos internos do JetFormBuilder: genérico, sem __refer/__form_id no lead", async () => {
+    const body = new URLSearchParams({
+      nome: "Joana Jet",
+      telefone: "11955550072",
+      cidade: "Belo Horizonte",
+      __refer: "jet-form-builder",
+      __form_id: "123",
+      __is_ajax: "1",
+    }).toString();
+    const res = await POST(formReq(TOKEN_ELEMENTOR, body), reqCtx(TOKEN_ELEMENTOR));
+    expect(res.status).toBe(200);
+    const leadId = ((await res.json()) as { data: { lead_id: string } }).data.lead_id;
+    const lead = rows(`select title, custom_fields from public.crm_leads where id = '${leadId}'`)[0]!;
+    expect(lead.title).toBe("Joana Jet");
+    const cf = lead.custom_fields as Record<string, unknown>;
+    expect(cf.cidade).toBe("Belo Horizonte");
+    expect(cf).not.toHaveProperty("__refer");
+    expect(cf).not.toHaveProperty("__form_id");
+    expect(cf).not.toHaveProperty("__is_ajax");
   });
 });

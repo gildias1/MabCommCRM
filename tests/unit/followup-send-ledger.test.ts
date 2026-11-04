@@ -1,9 +1,11 @@
 import { expect, it, vi } from "vitest";
 import { sendWithLedger } from "@/lib/agent-engine/edge/crm/send-ledger";
+import { ApiError } from "@/lib/api/types";
+import { OrgNaoOperanteError } from "@/lib/organizacao/operante";
 type Store=Parameters<typeof sendWithLedger>[0];
 const intent={tenantId:'org',leadId:'contact',jobId:'job',seq:1,body:'Retomar consulta'};
 function store(status='requested',message:{id:string;status:string}|null=null):Store{
- return {create:vi.fn(async()=>{throw {code:'23505'};}),find:vi.fn(async()=>({id:'ledger-original',status:status as 'requested',crm_message_id:message?.id??null})),rotate:vi.fn(async()=> 'new-ledger'),message:vi.fn(async()=>message),update:vi.fn(async()=>{})};
+ return {create:vi.fn(async()=>{throw {code:'23505'};}),find:vi.fn(async()=>({id:'ledger-original',status:status as 'requested',crm_message_id:message?.id??null})),rotate:vi.fn(async()=> 'new-ledger'),message:vi.fn(async()=>message),update:vi.fn(async()=>{}),setMediaPath:vi.fn(async()=>'unused-in-this-test')};
 }
 it('executor novo reconhece aceito sem chamar transporte novamente',async()=>{
  const db=store('accepted',{id:'message',status:'sent'}),send=vi.fn();
@@ -29,4 +31,16 @@ it('mensagem failed/queued nunca confirma sent',async()=>{
   const db=store();const send=vi.fn(async()=>({id:'message',status}));
   expect((await sendWithLedger(db,intent,send)).kind).toBe(status);expect(db.update).not.toHaveBeenCalledWith('org','ledger-original','accepted',expect.anything(),expect.anything());
  }
+});
+it('organização parada não é veto do contato: o erro sobe e o ledger NÃO vira vetoed',async()=>{
+ const db=store();db.create=vi.fn(async()=>'ledger-novo');
+ const send=vi.fn(async()=>{throw new OrgNaoOperanteError('org');});
+ await expect(sendWithLedger(db,intent,send)).rejects.toBeInstanceOf(OrgNaoOperanteError);
+ expect(db.update).not.toHaveBeenCalled();
+});
+it('403 do contato bloqueado continua virando blocked (controle)',async()=>{
+ const db=store();db.create=vi.fn(async()=>'ledger-novo');
+ const send=vi.fn(async()=>{throw new ApiError(403,'forbidden',undefined,'req');});
+ expect((await sendWithLedger(db,intent,send)).kind).toBe('blocked');
+ expect(db.update).toHaveBeenCalledWith('org','ledger-novo','vetoed',null,'handler 403');
 });

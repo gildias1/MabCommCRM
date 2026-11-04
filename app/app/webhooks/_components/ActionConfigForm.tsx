@@ -9,6 +9,7 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Select,
   SelectContent,
@@ -19,21 +20,122 @@ import {
 import { usePipelines, usePipelineStages } from "@/hooks/webhooks/useWebhookSources";
 import { useAgentsList } from "@/hooks/ai/useAgents";
 import { channelLabel, useChannelSessions } from "@/hooks/channels/useChannelSessions";
-import { useAssignableMembers } from "@/hooks/inbox/useAssignableMembers";
+import { useAssignableMembers, type AssignableMember } from "@/hooks/inbox/useAssignableMembers";
+import { useDefaultPipeline } from "@/hooks/pipelines/useDefaultPipeline";
+import {
+  CHAVE_DA_ESCOLHA,
+  ESCOLHA_PADRAO,
+  lerEscolhaNoEnvio,
+  type EscolhaNoEnvio,
+} from "@/lib/agenda/escolha-no-envio";
+import { camposDeDataDoNegocio, camposDoFunil } from "@/lib/leads/campos-do-funil";
 import { apiClient } from "@/lib/api/client";
-import type { FollowupFlowPointerRow } from "@/hooks/followup/useFollowupFlows";
+import { useAuth } from "@/hooks/auth/AuthProvider";
+import {
+  followupFlowsListQueryKey,
+  type FollowupFlowPointerRow,
+} from "@/hooks/followup/useFollowupFlows";
+import type { PlanoDeTarefas } from "@/lib/tarefas/plano";
+import { CaretDown, CaretUp, Pause, Play, X } from "@/lib/ui/icons";
+import { rotuloDoMembro } from "@/lib/users/rotulo-do-atendente";
+
+/**
+ * #2041 — uma pessoa fixa (a forma de sempre, sem `modo`) ou um rodízio, em que
+ * a posição na `fila` é a ordem. Mesma forma do `configDoAtribuirSchema` da API.
+ */
+export type ConfigDoAtribuir =
+  | {
+      modo?: "fixo";
+      user_id: string;
+      /**
+       * #3514 — a passagem SDR → Closer. O negócio muda de dono sempre; estas
+       * duas caixas decidem se o CLIENTE vai junto. Desligadas por padrão, e
+       * `undefined` (não `false`) é o que está gravado nas regras de antes: o
+       * payload antigo continua idêntico.
+       */
+      contato?: boolean;
+      conversas?: boolean;
+    }
+  | { modo: "rodizio"; fila: FilaDaAtribuicao }
+  /**
+   * #3804 — o destino dinâmico: quem recebe é o que o NEGÓCIO já tem
+   * (responsável e/ou dono da carteira do cliente), e o `fallback` decide quando
+   * ninguém serve. Mesma forma do `configDoAtribuirSchema` da API.
+   */
+  | {
+      modo: "destino";
+      destinos: DestinoDoAtribuir[];
+      fallback:
+        | { modo: "fixo"; user_id: string }
+        | { modo: "rodizio"; fila: FilaDaAtribuicao };
+      contato?: boolean;
+      conversas?: boolean;
+    };
+
+/** Uma pessoa da fila do rodízio — a posição no array é a ordem da vez. */
+export type FilaDaAtribuicao = Array<{ user_id: string; pausado: boolean }>;
+
+/** O `config` quando o modo é o destino dinâmico (#3804). */
+export type ConfigDoDestino = Extract<ConfigDoAtribuir, { modo: "destino" }>;
+
+/** Os três jeitos de a ação escolher quem recebe. */
+export type ModoDaAtribuicao = "fixo" | "rodizio" | "destino";
+
+/**
+ * Os destinos do #3804, na ordem em que são tentados — o MESMO vocabulário de
+ * `DESTINOS_DO_ATRIBUTO` no schema da API (`lib/schemas/webhooks`). Aqui como
+ * constante própria para a tela não puxar o zod para o bundle do cliente.
+ */
+export const DESTINOS_DO_ATRIBUIR = ["responsavel_do_negocio", "dono_da_carteira"] as const;
+export type DestinoDoAtribuir = (typeof DESTINOS_DO_ATRIBUIR)[number];
 
 export type ActionItem =
   | { type: "create_or_move_lead"; config: { pipeline_id: string; stage_id: string } }
-  | { type: "send_whatsapp_message"; config: { channel_session_id: string; template: string } }
+  | {
+      type: "send_whatsapp_message";
+      config: {
+        channel_session_id: string;
+        template: string;
+        media_url?: string | null;
+        /** #3813 — o que o passo faz com quem tem horário marcado. Ausente = `adiar`. */
+        quando_ha_compromisso?: EscolhaNoEnvio;
+      };
+    }
+  // #2726 — o e-mail de saída: mesmo campo que a irmã de WhatsApp (`assunto`/
+  // `corpo` no lugar do `template`), e `email_fixo` só preenche quando o
+  // destinatário é o endereço gravado na regra. `membro_id` só preenche no
+  // destinatário "membro da equipe" (#2642, recorte do PR #2834).
+  | {
+      type: "send_email";
+      config: {
+        destinatario: "contato" | "dono_do_lead" | "membro_da_equipe" | "fixo";
+        email_fixo: string;
+        membro_id: string;
+        assunto: string;
+        corpo: string;
+        formato: string;
+      };
+    }
   | {
       type: "send_ai_message";
-      config: { agent_id: string; channel_session_id: string; instruction: string };
+      config: {
+        agent_id: string;
+        channel_session_id: string;
+        instruction: string;
+        /** #3813 — mesma escolha da irmã de WhatsApp. Ausente = `adiar`. */
+        quando_ha_compromisso?: EscolhaNoEnvio;
+      };
     }
-  | { type: "add_tag"; config: { tags: string[] } }
-  | { type: "assign_owner"; config: { user_id: string } }
+  | {
+      type: "add_tag";
+      config: { tags: string[]; destino?: "card" | "contato" };
+    }
+  | { type: "assign_owner"; config: ConfigDoAtribuir }
   | { type: "call_webhook"; config: { url: string; secret?: string; secret_enc?: string; include_owner?: boolean } }
-  | { type: "start_message_flow"; config: { flow_pointer_id: string } }
+  | {
+      type: "start_message_flow";
+      config: { flow_pointer_id: string; surface?: "followup" | "atendimento"; replace_live_flow?: boolean };
+    }
   // #1540 — o lembrete interno: mesmos campos do schema da API e do nó de fluxo.
   | {
       type: "create_task";
@@ -43,7 +145,20 @@ export type ActionItem =
         atribuir_a: "dono_do_lead" | { usuario_id: string };
         prioridade: string;
       };
-    };
+    }
+  // #1752 — a SEQUÊNCIA: o plano mora em `organizations.settings.task_plans`,
+  // e o editor só escolhe QUAL deles aplicar. `plano_id` é o id do JSON (não
+  // uuid) — mesmos campos do schema da API e da ação `apply_task_plan`.
+  | { type: "apply_task_plan"; config: { plano_id: string } }
+  // #3727 — a data do atendimento vai para um campo de DATA do negócio; quem
+  // conta os dias é a regra do gatilho de data do funil (#989). Mesmos campos
+  // do schema da API: o funil dono do campo e a CHAVE do campo.
+  | { type: "set_lead_date_field"; config: { pipeline_id: string; campo: string } }
+  // #2642 — o destino é o WhatsApp que o ADMIN já registrou em Avisos. Por
+  // isso não existe campo de número, de endereço, de pessoa nem de canal: a
+  // configuração guarda só o canal, e é o executor que lê o destino
+  // cadastrado. Mesmos campos do schema da API.
+  | { type: "notify_team"; config: { canal: "whatsapp" } };
 
 export function defaultActionConfig(type: ActionItem["type"]): ActionItem {
   switch (type) {
@@ -51,6 +166,20 @@ export function defaultActionConfig(type: ActionItem["type"]): ActionItem {
       return { type, config: { pipeline_id: "", stage_id: "" } };
     case "send_whatsapp_message":
       return { type, config: { channel_session_id: "", template: "" } };
+    // #2726 — o e-mail de saída: a MESMA forma que o schema da API exige
+    // (`formato` sempre presente, porque a tela desenha a escolha).
+    case "send_email":
+      return {
+        type,
+        config: {
+          destinatario: "contato",
+          email_fixo: "",
+          membro_id: "",
+          assunto: "",
+          corpo: "",
+          formato: "texto",
+        },
+      };
     case "send_ai_message":
       return { type, config: { agent_id: "", channel_session_id: "", instruction: "" } };
     case "add_tag":
@@ -60,19 +189,124 @@ export function defaultActionConfig(type: ActionItem["type"]): ActionItem {
     case "call_webhook":
       return { type, config: { url: "" } };
     case "start_message_flow":
-      return { type, config: { flow_pointer_id: "" } };
+      // #2647 — o padrão é follow-up, o comportamento de sempre; `atendimento`
+      // é a opção que quem monta a regra escolhe, e só ela muda o caminho.
+      return { type, config: { flow_pointer_id: "", surface: "followup" } };
     // #1540 — o lembrete interno: mesma forma que o schema da API exige.
     case "create_task":
       return {
         type,
         config: { titulo: "", vence_em_dias: 1, atribuir_a: "dono_do_lead", prioridade: "medium" },
       };
+    case "apply_task_plan":
+      return { type, config: { plano_id: "" } };
+    // #3727 — o funil dono do campo e a chave dele. `campo` nasce vazio e só é
+    // preenchido depois de escolher o funil: a lista de campos é DELE.
+    case "set_lead_date_field":
+      return { type, config: { pipeline_id: "", campo: "" } };
+    // #2642 — o destino é o WhatsApp que o ADMIN cadastrou em Avisos, e só
+    // ele: depois do recorte do PR #2834 não há pessoa nem canal a escolher, e
+    // por isso o `config` guarda apenas o canal (o schema exige o literal).
+    case "notify_team":
+      return { type, config: { canal: "whatsapp" } };
   }
 }
 
 interface FormProps<T> {
   config: T;
   onChange: (config: T) => void;
+}
+
+/**
+ * #3813 — AS TRÊS RESPOSTAS PARA "E SE O CONTATO TIVER HORÁRIO MARCADO?".
+ *
+ * A escolha mora no `config` do PASSO que envia, e não no `trigger_config`:
+ * é de lá que `lerEscolhaNoEnvio` a lê no disparo (`send-whatsapp.ts:24`,
+ * `send-ai-message.ts:64`), e gravar no gatilho daria uma tela que o motor não
+ * obedece. Cada passo tem a sua — a mesma regra pode adiar o lembrete de
+ * cobrança e mandar o pós-atendimento na hora.
+ *
+ * A ajuda de cada opção diz o EFEITO, não o nome do campo: quem lê esta gaveta
+ * é quem descobriu que os parabéns saíram duas semanas atrasados.
+ */
+const ESCOLHAS_DA_AGENDA: Array<{ valor: EscolhaNoEnvio; rotulo: string; ajuda: string }> = [
+  {
+    valor: "adiar",
+    rotulo: "Adiar e enviar depois do horário",
+    ajuda:
+      "A mensagem espera o atendimento terminar e sai logo depois. É o comportamento de sempre e o que continua valendo em quem nunca mexeu aqui.",
+  },
+  {
+    valor: "enviar",
+    rotulo: "Enviar mesmo assim",
+    ajuda:
+      "A mensagem sai na hora, mesmo com atendimento marcado. Serve para o pós-atendimento e o aniversário, que perdem o sentido se esperarem.",
+  },
+  {
+    valor: "nao_enviar",
+    rotulo: "Não enviar",
+    ajuda:
+      "A mensagem não sai e o pulo fica registrado na Atividade com o motivo “contato com horário marcado”, para a equipe saber que a automação passou.",
+  },
+];
+
+/**
+ * O config do passo com a escolha nova — preservando o resto.
+ *
+ * `...config` é o que impede a escolha de apagar o número, a mensagem e a
+ * mídia que a pessoa acabou de preencher. `adiar` é o padrão declarado da
+ * leitura tolerante, então voltar para ele REMOVE a chave: a regra de antes
+ * desta entrega não a tem, e um payload sem ela é byte a byte o de sempre.
+ */
+function configComEscolha<T extends object>(config: T, escolha: EscolhaNoEnvio): T {
+  const { [CHAVE_DA_ESCOLHA]: _anterior, ...resto } = config as Record<string, unknown>;
+  return (
+    escolha === ESCOLHA_PADRAO ? resto : { ...resto, [CHAVE_DA_ESCOLHA]: escolha }
+  ) as T;
+}
+
+function EscolhaQuandoHaCompromisso({
+  escolha,
+  onChange,
+}: {
+  /** O valor JÁ lido com `lerEscolhaNoEnvio` — quem chama não reimplementa a leitura. */
+  escolha: EscolhaNoEnvio;
+  onChange: (escolha: EscolhaNoEnvio) => void;
+}) {
+  const t = useT();
+  const grupo = React.useId();
+
+  return (
+    <div className="space-y-1">
+      <Label id={`${grupo}-rotulo`}>{t("Quando o contato tiver horário marcado")}</Label>
+      <p className="text-xs text-muted-foreground">
+        {t(
+          "Em qualquer das três continuam valendo o descadastro do contato, a janela de envio do número e o limite diário.",
+        )}
+      </p>
+      <div role="radiogroup" aria-labelledby={`${grupo}-rotulo`} className="space-y-1">
+        {ESCOLHAS_DA_AGENDA.map((opcao) => (
+          <label
+            key={opcao.valor}
+            className="flex cursor-pointer items-start gap-2 rounded-md border p-3"
+          >
+            <input
+              type="radio"
+              name={grupo}
+              value={opcao.valor}
+              checked={escolha === opcao.valor}
+              onChange={() => onChange(opcao.valor)}
+              className="mt-1"
+            />
+            <span className="space-y-0.5">
+              <span className="block text-sm font-medium">{t(opcao.rotulo)}</span>
+              <span className="block text-xs text-muted-foreground">{t(opcao.ajuda)}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function CreateOrMoveLeadForm({
@@ -117,7 +351,7 @@ function CreateOrMoveLeadForm({
         >
           <SelectTrigger>
             <SelectValue
-              placeholder={config.pipeline_id ? "Escolha a etapa" : "Escolha o funil primeiro"}
+              placeholder={config.pipeline_id ? t("Escolha a etapa") : t("Escolha o funil primeiro")}
             />
           </SelectTrigger>
           <SelectContent>
@@ -133,6 +367,9 @@ function CreateOrMoveLeadForm({
   );
 }
 
+// O rótulo de cada variável é chave do dicionário e passa por t() onde vira botão: escrito cru, ele saía em
+// português em todo idioma. Só estas três: os campos do formulário que vêm junto são rótulos que a pessoa escreveu,
+// e dado não se traduz.
 const TEMPLATE_VARS = [
   { token: "{{nome}}", label: "Nome" },
   { token: "{{telefone}}", label: "Telefone" },
@@ -142,10 +379,24 @@ const TEMPLATE_VARS = [
 function SendWhatsappForm({
   config,
   onChange,
-}: FormProps<{ channel_session_id: string; template: string }>) {
+}: FormProps<{
+  channel_session_id: string;
+  template: string;
+  media_url?: string | null;
+  quando_ha_compromisso?: EscolhaNoEnvio;
+}>) {
   const t = useT();
   const { data: sessions } = useChannelSessions();
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+  // Uma regra pode ter mais de uma ação de WhatsApp: id fixo repetiria na página.
+  const midiaId = React.useId();
+  // Os campos cadastrados no funil (Configurações › Funis) viram botões: quem
+  // monta a mensagem clica em "Serviço" em vez de adivinhar o nome interno. O
+  // token é só a chave — `renderTemplate` a resolve em `lead.custom_fields`.
+  const pipeline = useDefaultPipeline(true);
+  const camposDoFormulario = camposDoFunil(pipeline.data?.pipeline.settings ?? null)
+    .filter((f) => !TEMPLATE_VARS.some((v) => v.token === `{{${f.key}}}`))
+    .map((f) => ({ token: `{{${f.key}}}`, label: f.label }));
 
   const insertVar = (token: string) => {
     const el = textareaRef.current;
@@ -174,7 +425,7 @@ function SendWhatsappForm({
           <SelectContent>
             {(sessions ?? []).map((s) => (
               <SelectItem key={s.id} value={s.id} disabled={s.status !== "WORKING"}>
-                {channelLabel(s) + (s.status !== "WORKING" ? " — desconectado" : "")}
+                {channelLabel(s) + (s.status !== "WORKING" ? t(" — desconectado") : "")}
               </SelectItem>
             ))}
           </SelectContent>
@@ -188,7 +439,7 @@ function SendWhatsappForm({
       <div className="space-y-1">
         <Label>{t("Mensagem")}</Label>
         <div className="flex flex-wrap gap-1">
-          {TEMPLATE_VARS.map((v) => (
+          {[...TEMPLATE_VARS.map((v) => ({ ...v, label: t(v.label) })), ...camposDoFormulario].map((v) => (
             <Button
               key={v.token}
               type="button"
@@ -205,7 +456,7 @@ function SendWhatsappForm({
           rows={4}
           value={config.template}
           onChange={(e) => onChange({ ...config, template: e.target.value })}
-          placeholder="Oi {{nome}}, tudo bem?"
+          placeholder={t("Oi {{nome}}, tudo bem?")}
         />
         <p className="text-xs text-muted-foreground">
           {/* NÃO cravar "7h e 22h": a janela passou a vir dos ajustes DO NÚMERO
@@ -214,6 +465,210 @@ function SendWhatsappForm({
           {t("Respeitamos a janela de envio e o limite diário configurados para esse número em Conexões — fora da janela, a mensagem espera a próxima.")}
         </p>
       </div>
+      <div className="space-y-1">
+        <Label htmlFor={midiaId}>{t("Imagem, vídeo, áudio ou documento (opcional)")}</Label>
+        <Input
+          id={midiaId}
+          type="url"
+          value={config.media_url ?? ""}
+          onChange={(e) => onChange({ ...config, media_url: e.target.value || null })}
+          placeholder="https://…/oferta.pdf"
+        />
+        <p className="text-xs text-muted-foreground">
+          {t("Com uma imagem, um vídeo, um áudio ou um documento, a mensagem acima vira a legenda do arquivo (o áudio sai como mensagem de voz, sem legenda — o texto não vai junto). Em número oficial, fora da janela de 24h a mídia não sai — só um modelo aprovado.")}
+        </p>
+      </div>
+      {/* #3813 — a escolha da agenda DESTE passo. */}
+      <EscolhaQuandoHaCompromisso
+        escolha={lerEscolhaNoEnvio(config)}
+        onChange={(escolha) => onChange(configComEscolha(config, escolha))}
+      />
+    </div>
+  );
+}
+
+/**
+ * "Enviar e-mail" (#2726) — quem recebe, o assunto e o corpo.
+ *
+ * O corpo usa o MESMO jogo de variáveis da irmã de WhatsApp (`TEMPLATE_VARS`
+ * + os campos do funil), porque quem montou a regra já escreveu aquela
+ * mensagem e não deve recomeçar: `{{destino}}` resolve igual nos dois canais.
+ *
+ * #2642 (recorte do PR #2834) acrescentou duas coisas, e é aqui que elas
+ * aparecem: o destinatário "membro da equipe" (o e-mail que antes morava no
+ * `notify_team`) e o botão `{{resumo}}`, que insere o resumo automático do
+ * negócio. O endereço da pessoa NÃO se digita: vem do acesso dela, e o vínculo
+ * com a empresa é conferido no momento do envio — por isso o aviso embaixo do
+ * campo.
+ *
+ * O que NÃO está aqui de propósito: transporte, credencial e remetente. O
+ * envio sai pelo que já foi configurado em Admin › E-mail (SMTP ou Resend) —
+ * e o aviso embaixo do corpo diz isso, porque sem ele a pessoa procura uma
+ * chave nova que não existe e conclui que a ação não funciona.
+ */
+function SendEmailForm({
+  config,
+  onChange,
+}: FormProps<{
+  destinatario: "contato" | "dono_do_lead" | "membro_da_equipe" | "fixo";
+  email_fixo: string;
+  membro_id: string;
+  assunto: string;
+  corpo: string;
+  formato: string;
+}>) {
+  const t = useT();
+  const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+  const { data: membros } = useAssignableMembers(true);
+  const pipeline = useDefaultPipeline(true);
+  const camposDoFormulario = camposDoFunil(pipeline.data?.pipeline.settings ?? null)
+    .filter((f) => !TEMPLATE_VARS.some((v) => v.token === `{{${f.key}}}`))
+    .map((f) => ({ token: `{{${f.key}}}`, label: f.label }));
+
+  const insertVar = (token: string) => {
+    const el = textareaRef.current;
+    const current = config.corpo;
+    const start = el?.selectionStart ?? current.length;
+    const end = el?.selectionEnd ?? current.length;
+    const next = current.slice(0, start) + token + current.slice(end);
+    onChange({ ...config, corpo: next });
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(start + token.length, start + token.length);
+    });
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="grid gap-2 sm:grid-cols-2">
+        <div className="space-y-1">
+          <Label>{t("Destinatário")}</Label>
+          <Select
+            value={config.destinatario}
+            onValueChange={(v) =>
+              onChange({
+                ...config,
+                destinatario: v as "contato" | "dono_do_lead" | "membro_da_equipe" | "fixo",
+              })
+            }
+          >
+            <SelectTrigger>
+              <SelectValue placeholder={t("Escolha quem recebe")} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="contato">{t("E-mail do contato")}</SelectItem>
+              <SelectItem value="dono_do_lead">{t("E-mail do responsável do negócio")}</SelectItem>
+              <SelectItem value="membro_da_equipe">{t("E-mail de uma pessoa da equipe")}</SelectItem>
+              <SelectItem value="fixo">{t("Endereço fixo")}</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-1">
+          <Label>{t("Assunto")}</Label>
+          <Input
+            value={config.assunto}
+            onChange={(e) => onChange({ ...config, assunto: e.target.value })}
+            placeholder={t("Sua viagem para {{destino}}")}
+          />
+        </div>
+      </div>
+      {config.destinatario === "fixo" ? (
+        <div className="space-y-1">
+          <Label>{t("Endereço de e-mail")}</Label>
+          <Input
+            value={config.email_fixo}
+            onChange={(e) => onChange({ ...config, email_fixo: e.target.value })}
+            placeholder="nome@empresa.com"
+          />
+          <p className="text-xs text-muted-foreground">
+            {t("Um endereço fixo recebe todos os envios desta regra.")}
+          </p>
+        </div>
+      ) : null}
+      {config.destinatario === "membro_da_equipe" ? (
+        <div className="space-y-1">
+          <Label>{t("Pessoa da equipe")}</Label>
+          <Select
+            value={config.membro_id}
+            onValueChange={(v) => onChange({ ...config, membro_id: v })}
+          >
+            <SelectTrigger>
+              <SelectValue placeholder={t("Escolha quem recebe")} />
+            </SelectTrigger>
+            <SelectContent>
+              {(membros ?? []).map((m) => (
+                <SelectItem key={m.user_id} value={m.user_id}>
+                  {rotuloDoMembro(m, t)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">
+            {t(
+              "A pessoa recebe no e-mail cadastrado no acesso dela, e o vínculo com a empresa é conferido no momento do envio.",
+            )}
+          </p>
+        </div>
+      ) : null}
+      <div className="space-y-1">
+        <Label>{t("Corpo do e-mail")}</Label>
+        <div className="flex flex-wrap gap-1">
+          {[
+            ...TEMPLATE_VARS.map((v) => ({ ...v, label: t(v.label) })),
+            // #2642 — a variável desta ação: o resumo do negócio montado no
+            // disparo (só dado de forma fixa + atalho para a ficha; doc 176 A).
+            // Fica só no e-mail de propósito: no WhatsApp da equipe o corpo É
+            // o resumo, sem modelo.
+            { token: "{{resumo}}", label: t("Resumo do negócio") },
+            ...camposDoFormulario,
+          ].map((v) => (
+            <Button
+              key={v.token}
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => insertVar(v.token)}
+            >
+              {v.label}
+            </Button>
+          ))}
+        </div>
+        <Textarea
+          ref={textareaRef}
+          rows={5}
+          value={config.corpo}
+          onChange={(e) => onChange({ ...config, corpo: e.target.value })}
+          placeholder={t("Oi {{nome}}, tudo bem?")}
+        />
+      </div>
+      <div className="space-y-1">
+        <Label>{t("Formato do corpo")}</Label>
+        <Select value={config.formato || "texto"} onValueChange={(v) => onChange({ ...config, formato: v })}>
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="texto">{t("Texto simples")}</SelectItem>
+            <SelectItem value="html">{t("HTML simples")}</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {t(
+          "As variáveis do WhatsApp valem aqui: {{nome}}, {{primeiro_nome}}, {{lead.title}} e os campos do formulário como {{destino}}.",
+        )}
+      </p>
+      <p className="text-xs text-muted-foreground">
+        {t('Para não depender do dado, ponha um texto de reserva: {{primeiro_nome|"aluno"}}.')}
+      </p>
+      <p className="text-xs text-muted-foreground">
+        {t(
+          "A variável Resumo do negócio leva o nome da regra, o cliente, o telefone, o valor, a pontuação e um atalho para o negócio no CRM (quando a instalação tem endereço público), e nada do que foi conversado com o cliente. O resto do corpo vai como você escrever, inclusive as outras variáveis.",
+        )}
+      </p>
+      <p className="text-xs text-muted-foreground">
+        {t("O envio usa o e-mail configurado em Admin › E-mail (SMTP ou Resend).")}
+      </p>
     </div>
   );
 }
@@ -234,7 +689,12 @@ function SendWhatsappForm({
 function SendAiMessageForm({
   config,
   onChange,
-}: FormProps<{ agent_id: string; channel_session_id: string; instruction: string }>) {
+}: FormProps<{
+  agent_id: string;
+  channel_session_id: string;
+  instruction: string;
+  quando_ha_compromisso?: EscolhaNoEnvio;
+}>) {
   const t = useT();
   const { data: agentes } = useAgentsList();
   const { data: sessions } = useChannelSessions();
@@ -279,7 +739,7 @@ function SendAiMessageForm({
           <SelectContent>
             {(sessions ?? []).map((s) => (
               <SelectItem key={s.id} value={s.id} disabled={s.status !== "WORKING"}>
-                {channelLabel(s) + (s.status !== "WORKING" ? " — desconectado" : "")}
+                {channelLabel(s) + (s.status !== "WORKING" ? t(" — desconectado") : "")}
               </SelectItem>
             ))}
           </SelectContent>
@@ -294,57 +754,509 @@ function SendAiMessageForm({
           maxLength={1000}
           value={config.instruction}
           onChange={(e) => onChange({ ...config, instruction: e.target.value })}
-          placeholder={
-            "Ex.: Agradeça o interesse citando o segmento que a pessoa informou, mostre em uma frase " +
-            "como a gente resolve a dificuldade que ela descreveu, e pergunte qual o melhor horário para conversar."
-          }
+          placeholder={t(
+            "Ex.: Agradeça o interesse citando o segmento que a pessoa informou, mostre em uma frase como a gente resolve a dificuldade que ela descreveu, e pergunte qual o melhor horário para conversar.",
+          )}
         />
         <p className="text-xs text-muted-foreground">
           {t("O agente já sabe que é a PRIMEIRA mensagem, logo depois de a pessoa preencher o formulário, e recebe todos os campos que ela respondeu. Aqui você diz o que fazer com eles — quanto mais concreto, melhor a mensagem.")}
         </p>
       </div>
-    </div>
-  );
-}
 
-function AddTagForm({ config, onChange }: FormProps<{ tags: string[] }>) {
-  const t = useT();
-  const [text, setText] = React.useState(config.tags.join(", "));
-  return (
-    <div className="space-y-1">
-      <Label>{t("Tags (separadas por vírgula)")}</Label>
-      <Input
-        value={text}
-        onChange={(e) => {
-          setText(e.target.value);
-          const tags = e.target.value
-            .split(",")
-            .map((t) => t.trim())
-            .filter(Boolean);
-          onChange({ tags });
-        }}
-        placeholder="boas-vindas, novo-lead"
+      {/* #3813 — a mesma escolha da irmã de WhatsApp, no config DESTE passo. */}
+      <EscolhaQuandoHaCompromisso
+        escolha={lerEscolhaNoEnvio(config)}
+        onChange={(escolha) => onChange(configComEscolha(config, escolha))}
       />
     </div>
   );
 }
 
-function AssignOwnerForm({ config, onChange }: FormProps<{ user_id: string }>) {
+/**
+ * `add_tag` (#2498) — as tags, e AGORA o DESTINO delas.
+ *
+ * O destino é opcional na forma e no efeito: quem nunca mexeu continua sem
+ * chave no config e gravando no card, que é o comportamento de sempre. Só quem
+ * escolhe "Contato do lead" passa a gravar na caixa que o Inbox consulta — e
+ * a tela diz o que acontece quando o lead não tem contato (a ação é ignorada,
+ * nunca troca de destino sozinha).
+ */
+function AddTagForm({
+  config,
+  onChange,
+}: FormProps<{ tags: string[]; destino?: "card" | "contato" }>) {
   const t = useT();
-  const { data: members } = useAssignableMembers(true);
+  const [text, setText] = React.useState(config.tags.join(", "));
   return (
+    <div className="space-y-2">
+      <div className="space-y-1">
+        <Label>{t("Tags (separadas por vírgula)")}</Label>
+        <Input
+          value={text}
+          onChange={(e) => {
+            setText(e.target.value);
+            const tags = e.target.value
+              .split(",")
+              .map((t) => t.trim())
+              .filter(Boolean);
+            // `...config` preserva o destino escolhido: escrever `{ tags }`
+            // aqui apagaria a metade da tela que o operador acabou de preencher.
+            onChange({ ...config, tags });
+          }}
+          placeholder={t("boas-vindas, novo-lead")}
+        />
+      </div>
+      <div className="space-y-1">
+        <Label>{t("Destino da etiqueta")}</Label>
+        <Select
+          value={config.destino ?? "card"}
+          onValueChange={(v) => onChange({ ...config, destino: v as "card" | "contato" })}
+        >
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="card">{t("Card (comportamento atual)")}</SelectItem>
+            <SelectItem value="contato">{t("Contato do lead")}</SelectItem>
+          </SelectContent>
+        </Select>
+        {config.destino === "contato" && (
+          <p className="text-xs text-muted-foreground">
+            {t("Sem contato vinculado, a etiqueta não é aplicada.")}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A fila do rodízio (#2041) — o editor de quem entra, em que ordem, e quem está
+ * pausado. Ele mora em UM lugar porque a fila mora em dois: o modo `rodizio` e o
+ * `fallback` do destino dinâmico (#3804) usam a MESMA fila e a mesma vez
+ * (`fn_automation_rodizio_atribuir`); duplicar o editor faria a segunda cópia
+ * envelhecer sozinha.
+ */
+function FilaDoRodizio({
+  fila,
+  members,
+  carregandoMembros,
+  onChange,
+  doFallback = false,
+}: {
+  fila: FilaDaAtribuicao;
+  members: AssignableMember[] | undefined;
+  carregandoMembros: boolean;
+  onChange: (fila: FilaDaAtribuicao) => void;
+  /** No fallback do destino dinâmico (#3804) o título diz de qual fila se trata. */
+  doFallback?: boolean;
+}) {
+  const t = useT();
+  // Enquanto a lista de membros não chega, o nome é `null` (a tela mostra um
+  // esqueleto): o começo do user_id que aparecia ali não diz nada a ninguém.
+  const nomeDe = (userId: string) => {
+    if (carregandoMembros) return null;
+    const membro = members?.find((m) => m.user_id === userId);
+    return membro ? rotuloDoMembro(membro, t) : rotuloDoMembro({ user_id: userId }, t);
+  };
+  const aoMudarFila = (nova: FilaDaAtribuicao) => onChange(nova);
+  const trocar = (de: number, para: number) => {
+    const nova = [...fila];
+    const [pessoa] = nova.splice(de, 1);
+    if (pessoa) nova.splice(para, 0, pessoa);
+    aoMudarFila(nova);
+  };
+  const foraDaFila = (members ?? []).filter((m) => !fila.some((p) => p.user_id === m.user_id));
+
+  return (
+    <div className="space-y-2">
+  <div className="space-y-1">
+    <Label>{doFallback ? t("Fila do rodízio do fallback") : t("Fila do rodízio")}</Label>
+    <p className="text-xs text-muted-foreground">
+      {t("Cada lead vai para a próxima pessoa da fila, nesta ordem. Quem está pausado é pulado sem sair da fila.")}
+    </p>
+    {fila.length === 0 ? (
+      <p className="text-xs text-muted-foreground">{t("Ninguém na fila ainda. Adicione pelo menos uma pessoa.")}</p>
+    ) : (
+      <ol className="space-y-1" data-testid="fila-do-rodizio" aria-busy={carregandoMembros}>
+        {fila.map((pessoa, i) => {
+          const nomeCarregado = nomeDe(pessoa.user_id);
+          const nome = nomeCarregado ?? String(i + 1);
+          // Duas partes que QUEBRAM de linha quando a largura não cabe as
+          // duas (celular): o nome nunca disputa espaço com os 4 botões de
+          // 44px — a 360px ele ficava com 51px, e com 0px quando pausado.
+          return (
+            <li
+              key={pessoa.user_id}
+              className="flex flex-wrap items-center gap-x-1 gap-y-0.5 rounded-md border px-2 py-1"
+            >
+              <div className="flex min-w-0 grow basis-48 items-center gap-1" data-testid="pessoa-da-fila">
+                <span className="w-5 shrink-0 text-right text-xs text-muted-foreground">{i + 1}</span>
+                {nomeCarregado === null ? (
+                  <Skeleton aria-hidden className="h-4 w-24 max-w-full" />
+                ) : (
+                  <span
+                    className={`min-w-0 flex-1 truncate text-sm ${pessoa.pausado ? "text-muted-foreground line-through" : ""}`}
+                  >
+                    {nomeCarregado}
+                  </span>
+                )}
+                {pessoa.pausado ? (
+                  <span className="shrink-0 text-xs text-muted-foreground">{t("pausado")}</span>
+                ) : null}
+              </div>
+              <div className="ml-auto flex shrink-0 items-center">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`${t("Subir na fila")}: ${nome}`}
+                  disabled={i === 0}
+                  onClick={() => trocar(i, i - 1)}
+                >
+                  <CaretUp size={16} aria-hidden />
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`${t("Descer na fila")}: ${nome}`}
+                  disabled={i === fila.length - 1}
+                  onClick={() => trocar(i, i + 1)}
+                >
+                  <CaretDown size={16} aria-hidden />
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`${pessoa.pausado ? t("Voltar ao rodízio") : t("Pausar no rodízio")}: ${nome}`}
+                  onClick={() => aoMudarFila(fila.map((p, k) => (k === i ? { ...p, pausado: !p.pausado } : p)))}
+                >
+                  {pessoa.pausado ? <Play size={16} aria-hidden /> : <Pause size={16} aria-hidden />}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`${t("Tirar da fila")}: ${nome}`}
+                  onClick={() => aoMudarFila(fila.filter((_, k) => k !== i))}
+                >
+                  <X size={16} aria-hidden />
+                </Button>
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+    )}
+  </div>
+  {foraDaFila.length > 0 ? (
     <div className="space-y-1">
-      <Label>{t("Atendente")}</Label>
-      <Select value={config.user_id} onValueChange={(v) => onChange({ user_id: v })}>
+      <Label>{t("Adicionar à fila")}</Label>
+      <Select value="" onValueChange={(v) => aoMudarFila([...fila, { user_id: v, pausado: false }])}>
         <SelectTrigger>
-          <SelectValue placeholder={t("Escolha o atendente")} />
+          <SelectValue placeholder={t("Escolha quem entra no rodízio")} />
         </SelectTrigger>
         <SelectContent>
-          {(members ?? []).map((m) => (
+          {foraDaFila.map((m) => (
             <SelectItem key={m.user_id} value={m.user_id}>
-              {m.full_name ?? m.user_id.slice(0, 8)}
+              {rotuloDoMembro(m, t)}
             </SelectItem>
           ))}
+        </SelectContent>
+      </Select>
+    </div>
+  ) : null}
+    </div>
+  );
+}
+
+/**
+ * As caixas da #3514 — a passagem SDR → Closer. OPT-IN, e o texto diz o que NÃO
+ * muda quando a caixa está desligada: quem já tem automação no ar não pode passar
+ * a mover conversa por causa de uma tela nova. As mesmas caixas valem para os
+ * destinos dinâmicos (#3804): lá a pessoa é resolvida no disparo, mas a passagem
+ * do cliente e das conversas é a mesma decisão do operador.
+ */
+function OpcoesDePassagem({
+  config,
+  onChange,
+}: {
+  config: { contato?: boolean; conversas?: boolean };
+  onChange: (patch: { contato?: boolean; conversas?: boolean }) => void;
+}) {
+  const t = useT();
+  return (
+    <>
+        {/* #3514 — a passagem SDR → Closer. OPT-IN, e o texto diz o que NÃO
+            muda quando a caixa está desligada: quem já tem automação no ar não
+            pode passar a mover conversa por causa de uma tela nova. */}
+        <div className="flex items-center justify-between gap-3 rounded-md border p-3">
+          <div className="space-y-0.5">
+            <Label htmlFor="atribuir-passar-contato">{t("Passar também o contato (carteira)")}</Label>
+            <p className="text-xs text-muted-foreground">
+              {t(
+                "O cliente passa a ser deste atendente, no lugar do dono atual, e leva junto as conversas abertas que estavam com o dono anterior ou sem dono (as que a IA está atendendo ficam com a IA). Desligado, o cliente e as conversas ficam como estão.",
+              )}
+            </p>
+          </div>
+          <Switch
+            id="atribuir-passar-contato"
+            checked={config.contato === true}
+            onCheckedChange={(v) => onChange({ ...config, contato: v ? true : undefined })}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-3 rounded-md border p-3">
+          <div className="space-y-0.5">
+            <Label htmlFor="atribuir-passar-conversas">{t("Passar também as conversas abertas do contato")}</Label>
+            <p className="text-xs text-muted-foreground">
+              {t(
+                "As conversas abertas que hoje estão com qualquer outra pessoa vão para este atendente, como no botão Transferir. Esta opção não toca conversa encerrada nem conversa sem dono.",
+              )}
+            </p>
+          </div>
+          <Switch
+            id="atribuir-passar-conversas"
+            checked={config.conversas === true}
+            onCheckedChange={(v) => onChange({ ...config, conversas: v ? true : undefined })}
+          />
+        </div>
+    </>
+  );
+}
+
+/** De qual pessoa a regra parte ao trocar de modo — a que já estava escolhida. */
+function pessoaDaConfig(config: ConfigDoAtribuir): string {
+  if (config.modo === "rodizio") return config.fila[0]?.user_id ?? "";
+  if (config.modo === "destino") {
+    return config.fallback.modo === "fixo" ? config.fallback.user_id : (config.fallback.fila[0]?.user_id ?? "");
+  }
+  return config.user_id;
+}
+
+/**
+ * Troca o modo levando junto quem já estava escolhido: mudar de "pessoa fixa"
+ * para "rodízio" (ou para o fallback do destino) não pode obrigar o operador a
+ * escolher a pessoa de novo. As caixas da #3514 seguem com ele.
+ */
+function trocarModo(modo: ModoDaAtribuicao, config: ConfigDoAtribuir, onChange: (c: ConfigDoAtribuir) => void) {
+  const pessoa = pessoaDaConfig(config);
+  // Nem toda forma do union tem as caixas da #3514 (o rodízio puro não tem).
+  const caixas = config as { contato?: boolean; conversas?: boolean };
+  const passagem = {
+    ...(caixas.contato === true ? { contato: true } : {}),
+    ...(caixas.conversas === true ? { conversas: true } : {}),
+  };
+  if (modo === "rodizio") {
+    onChange({ modo: "rodizio", fila: pessoa ? [{ user_id: pessoa, pausado: false }] : [] });
+    return;
+  }
+  if (modo === "destino") {
+    onChange({
+      modo: "destino",
+      // A ordem é a da tentativa, não a do clique: o responsável do negócio
+      // primeiro, a carteira do contato depois.
+      destinos: [...DESTINOS_DO_ATRIBUIR],
+      fallback: { modo: "fixo", user_id: pessoa },
+      ...passagem,
+    });
+    return;
+  }
+  onChange({ user_id: pessoa, ...passagem });
+}
+
+/**
+ * O destino dinâmico (#3804): "responsável do negócio" e "dono da carteira do
+ * contato", na ordem em que são tentados, e um fallback OBRIGATÓRIO.
+ *
+ * O fallback não é enfeite de formulário: sem ele, a regra que não acha ninguém
+ * simplesmente não atribui e o negócio fica sem dono em silêncio — o defeito que
+ * a issue existe para eliminar. Por isso ele nunca fica vazio na tela: nasce com
+ * a pessoa que já estava escolhida e o rodízio com a fila de antes.
+ */
+function DestinoForm({ config, onChange }: { config: ConfigDoDestino; onChange: (c: ConfigDoAtribuir) => void }) {
+  const t = useT();
+  const { data: members, isLoading: carregandoMembros } = useAssignableMembers(true);
+
+  // Objetos do fallback sempre com o TIPO do fallback: `{ ...config, fallback }`
+  // com o literal solto alargava `modo` para `string` e o onChange recusava.
+  const trocarFallback = (modoDoFallback: "fixo" | "rodizio") => {
+    const pessoa = pessoaDaConfig(config);
+    const fallback: ConfigDoDestino["fallback"] =
+      modoDoFallback === "rodizio"
+        ? { modo: "rodizio", fila: pessoa ? [{ user_id: pessoa, pausado: false }] : [] }
+        : { modo: "fixo", user_id: pessoa };
+    onChange({ ...config, fallback });
+  };
+
+  const alternar = (destino: (typeof DESTINOS_DO_ATRIBUIR)[number]) => {
+    const ligado = config.destinos.includes(destino);
+    // Pelo menos um destino: desligar o último deixaria a regra sem o que tentar,
+    // e o schema da API recusa `destinos` vazio.
+    if (ligado && config.destinos.length === 1) return;
+    const proximos = ligado ? config.destinos.filter((d) => d !== destino) : [...config.destinos, destino];
+    onChange({ ...config, destinos: DESTINOS_DO_ATRIBUIR.filter((d) => proximos.includes(d)) });
+  };
+
+  return (
+    <div className="space-y-2">
+      <ModoDoAtribuir modo="destino" onChange={(modo) => trocarModo(modo, config, onChange)} />
+      <div className="space-y-1">
+        <Label>{t("Destinos, na ordem em que são tentados")}</Label>
+        <p className="text-xs text-muted-foreground">
+          {t(
+            "Quem recebe é o que o negócio já tem: o responsável do negócio e, se ele não houver, o dono da carteira do cliente. Uma regra só para toda a equipe — o pós-venda de quem vendeu.",
+          )}
+        </p>
+        <ul className="space-y-1" data-testid="destinos-do-atribuir">
+          {DESTINOS_DO_ATRIBUIR.map((destino, i) => (
+            <li
+              key={destino}
+              className="flex items-center justify-between gap-3 rounded-md border p-3"
+              data-testid="destino-do-atribuir"
+            >
+              <div className="space-y-0.5">
+                <Label htmlFor={`atribuir-destino-${destino}`}>
+                  {i + 1}. {destino === "responsavel_do_negocio" ? t("Responsável do negócio") : t("Dono da carteira do contato")}
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  {destino === "responsavel_do_negocio"
+                    ? t("Quem está com o negócio hoje — no pós-venda, quem vendeu.")
+                    : t("Quem cuida do cliente, mesmo quando o negócio está com outra pessoa.")}
+                </p>
+              </div>
+              <Switch
+                id={`atribuir-destino-${destino}`}
+                checked={config.destinos.includes(destino)}
+                disabled={config.destinos.includes(destino) && config.destinos.length === 1}
+                onCheckedChange={() => alternar(destino)}
+              />
+            </li>
+          ))}
+        </ul>
+        <p className="text-xs text-muted-foreground">
+          {t(
+            "Quem não puder receber (saiu da equipe ou é só leitor) é pulado, e a regra segue para o próximo. A Atividade mostra qual destino decidiu.",
+          )}
+        </p>
+      </div>
+      <div className="space-y-1">
+        <Label>{t("Se nenhum destino servir, atribuir a")}</Label>
+        <p className="text-xs text-muted-foreground">
+          {t("O fallback é obrigatório: é o que impede a regra de não atribuir e deixar o negócio sem dono em silêncio.")}
+        </p>
+        <Select
+          value={config.fallback.modo}
+          onValueChange={(v) => trocarFallback(v === "rodizio" ? "rodizio" : "fixo")}
+        >
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="fixo">{t("Uma pessoa fixa")}</SelectItem>
+            <SelectItem value="rodizio">{t("Em rodízio entre estas pessoas")}</SelectItem>
+          </SelectContent>
+        </Select>
+        {config.fallback.modo === "fixo" ? (
+          <Select
+            value={config.fallback.user_id}
+            onValueChange={(v) => {
+              const fallback: ConfigDoDestino["fallback"] = { modo: "fixo", user_id: v };
+              onChange({ ...config, fallback });
+            }}
+          >
+            <SelectTrigger>
+              <SelectValue placeholder={t("Escolha o atendente")} />
+            </SelectTrigger>
+            <SelectContent>
+              {(members ?? []).map((m) => (
+                <SelectItem key={m.user_id} value={m.user_id}>
+                  {rotuloDoMembro(m, t)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        ) : (
+          <FilaDoRodizio
+            fila={config.fallback.fila}
+            members={members}
+            carregandoMembros={carregandoMembros}
+            doFallback
+            onChange={(fila) => {
+              const fallback: ConfigDoDestino["fallback"] = { modo: "rodizio", fila };
+              onChange({ ...config, fallback });
+            }}
+          />
+        )}
+      </div>
+      <OpcoesDePassagem
+        config={config}
+        onChange={(patch) => onChange({ ...config, ...patch })}
+      />
+    </div>
+  );
+}
+
+function AssignOwnerForm({ config, onChange }: FormProps<ConfigDoAtribuir>) {
+  const t = useT();
+  const { data: members, isLoading: carregandoMembros } = useAssignableMembers(true);
+
+  if (config.modo === "destino") {
+    return <DestinoForm config={config} onChange={onChange} />;
+  }
+
+  if (config.modo === "rodizio") {
+    return (
+      <div className="space-y-2">
+        <ModoDoAtribuir modo="rodizio" onChange={(modo) => trocarModo(modo, config, onChange)} />
+        <FilaDoRodizio
+          fila={config.fila}
+          members={members}
+          carregandoMembros={carregandoMembros}
+          onChange={(fila) => onChange({ modo: "rodizio", fila })}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <ModoDoAtribuir modo="fixo" onChange={(modo) => trocarModo(modo, config, onChange)} />
+      <div className="space-y-1">
+        <Label>{t("Atendente")}</Label>
+        <Select value={config.user_id} onValueChange={(v) => onChange({ ...config, user_id: v })}>
+          <SelectTrigger>
+            <SelectValue placeholder={t("Escolha o atendente")} />
+          </SelectTrigger>
+          <SelectContent>
+            {(members ?? []).map((m) => (
+              <SelectItem key={m.user_id} value={m.user_id}>
+                {rotuloDoMembro(m, t)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      <OpcoesDePassagem config={config} onChange={(patch) => onChange({ ...config, ...patch })} />
+    </div>
+  );
+}
+
+/** A escolha entre pessoa fixa, rodízio e destino dinâmico. Trocar leva junto quem já estava escolhido. */
+function ModoDoAtribuir({ modo, onChange }: { modo: ModoDaAtribuicao; onChange: (novo: ModoDaAtribuicao) => void }) {
+  const t = useT();
+  return (
+    <div className="space-y-1">
+      <Label>{t("Como atribuir")}</Label>
+      <Select value={modo} onValueChange={(v) => v !== modo && onChange(v as ModoDaAtribuicao)}>
+        <SelectTrigger>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="fixo">{t("Um atendente fixo")}</SelectItem>
+          <SelectItem value="rodizio">{t("Em rodízio entre estas pessoas")}</SelectItem>
+          <SelectItem value="destino">{t("Responsável do negócio ou dono da carteira")}</SelectItem>
         </SelectContent>
       </Select>
     </div>
@@ -420,7 +1332,7 @@ function CreateTaskForm({
             <SelectItem value="dono_do_lead">{t("Dono do negócio")}</SelectItem>
             {(members ?? []).map((m) => (
               <SelectItem key={m.user_id} value={m.user_id}>
-                {m.full_name ?? m.user_id.slice(0, 8)}
+                {rotuloDoMembro(m, t)}
               </SelectItem>
             ))}
           </SelectContent>
@@ -451,7 +1363,7 @@ function CallWebhookForm({
         />
       </div>
       <div className="space-y-1">
-        <Label>Segredo (opcional)</Label>
+        <Label>{t("Segredo (opcional)")}</Label>
         <Input
           type="password"
           value={config.secret ?? ""}
@@ -461,7 +1373,7 @@ function CallWebhookForm({
             const { secret_enc: _enc, ...rest } = config;
             onChange(next ? { ...rest, secret: next } : { ...rest, secret: undefined });
           }}
-          placeholder={hasStoredSecret ? "•••••••• (definido — digite para trocar)" : "uma senha só sua"}
+          placeholder={hasStoredSecret ? t("•••••••• (definido — digite para trocar)") : t("uma senha só sua")}
         />
         <p className="text-xs text-muted-foreground">
           {hasStoredSecret
@@ -498,13 +1410,41 @@ function CallWebhookForm({
   );
 }
 
-function StartMessageFlowForm({ config, onChange }: FormProps<{ flow_pointer_id: string }>) {
+/**
+ * `start_message_flow` (#2647) — o seletor ganhou a SUPERFÍCIE do fluxo.
+ *
+ * O padrão é follow-up, que é o que toda regra já gravada aponta: mesma lista,
+ * mesma rota e MESMO caminho de inscrição de antes. Escolher atendimento troca
+ * a lista pela dos roteiros publicados (`?surface=atendimento`) e, na hora de
+ * executar, a ação passa por `iniciarFluxoDeAtendimento` — a entrada da
+ * palavra-gatilho e do roteador.
+ *
+ * Trocar de superfície LIMPA o fluxo escolhido: um id de follow-up não é um
+ * roteiro, e a regra não pode ficar gravada apontando para o outro lado.
+ */
+function StartMessageFlowForm({
+  config,
+  onChange,
+}: FormProps<{ flow_pointer_id: string; surface?: "followup" | "atendimento"; replace_live_flow?: boolean }>) {
   const t = useT();
+  const superficie: "followup" | "atendimento" =
+    config.surface === "atendimento" ? "atendimento" : "followup";
+  const ehRoteiro = superficie === "atendimento";
+  // O módulo é opcional por instalação (mesmo padrão do QueueTab): desligado, a
+  // opção some — salvo numa regra que já a grava, para não esconder o que está salvo.
+  const { activeOrg } = useAuth();
+  const roteirosLigados = activeOrg?.modulos_ligados?.includes("fluxos_atendimento") === true;
   const { data, isLoading } = useQuery({
-    queryKey: ["followup", "flows", "list"],
+    // Mesma chave do hook de Follow-ups (com o recorte no fim, como ele faz):
+    // a lista de follow-up continua a de sempre, e a dos roteiros fica separada.
+    queryKey: ehRoteiro
+      ? [...followupFlowsListQueryKey, "atendimento"]
+      : followupFlowsListQueryKey,
     queryFn: async () => {
       const res = await apiClient.get<{ data: FollowupFlowPointerRow[] }>(
-        "/api/v1/ai/followup-flows",
+        ehRoteiro
+          ? "/api/v1/ai/followup-flows?surface=atendimento"
+          : "/api/v1/ai/followup-flows",
       );
       return res.data;
     },
@@ -512,33 +1452,261 @@ function StartMessageFlowForm({ config, onChange }: FormProps<{ flow_pointer_id:
   const active = (data ?? []).filter((f) => f.status === "active");
 
   return (
+    <div className="space-y-3">
+      <div className="space-y-1">
+        <Label>{t("Tipo de fluxo")}</Label>
+        <Select
+          value={superficie}
+          onValueChange={(v) =>
+            onChange({
+              flow_pointer_id: "",
+              surface: v === "atendimento" ? "atendimento" : "followup",
+            })
+          }
+        >
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="followup">{t("Follow-up")}</SelectItem>
+            {roteirosLigados || ehRoteiro ? (
+              <SelectItem value="atendimento">{t("Atendimento")}</SelectItem>
+            ) : null}
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="space-y-1">
+        <Label>{ehRoteiro ? t("Fluxo de atendimento") : t("Fluxo de follow-up")}</Label>
+        <Select
+          value={config.flow_pointer_id}
+          onValueChange={(v) => onChange({ ...config, flow_pointer_id: v })}
+          disabled={isLoading}
+        >
+          <SelectTrigger>
+            <SelectValue placeholder={t("Escolha um fluxo publicado")} />
+          </SelectTrigger>
+          <SelectContent>
+            {active.map((f) => (
+              <SelectItem key={f.id} value={f.id}>
+                {f.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {!isLoading && active.length === 0 ? (
+          <p className="text-xs text-muted-foreground">
+            {ehRoteiro
+              ? t(
+                  "Nenhum fluxo de atendimento ativo. Publique um em Fluxos de atendimento para usá-lo aqui.",
+                )
+              : t("Nenhum fluxo ativo. Publique um follow-up em Follow-ups para usá-lo aqui.")}
+          </p>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            {t("Só entram fluxos publicados e ativos.")}
+          </p>
+        )}
+        {/* O roteiro não EMPURRA mensagem ao ser aberto: ele vale no próximo
+            turno da conversa. Dizer isso aqui é o que evita quem liga a regra
+            e espera sair uma mensagem na hora. */}
+        {ehRoteiro ? (
+          <p className="text-xs text-muted-foreground">
+            {t(
+              "O roteiro de atendimento acontece na conversa: a automação abre o atendimento e a primeira pergunta sai quando o cliente responder.",
+            )}
+          </p>
+        ) : null}
+        {/* Trocar de fluxo só existe no follow-up: o roteiro de atendimento tem a
+            própria regra de um por contato. Um contato só anda em UM follow-up
+            por vez; desligado, a regra perde para o fluxo que chegou antes — e
+            quem acabou de pedir pode ficar sem a confirmação porque já estava
+            num fluxo de remarketing. */}
+        {!ehRoteiro ? (
+          <div className="mt-2 flex items-center justify-between gap-3 rounded-md border p-3">
+            <div className="space-y-0.5">
+              <Label>{t("Tirar o contato de outro fluxo")}</Label>
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  "Se o contato já estiver em outro fluxo, ele sai daquele e entra neste. Fluxo pausado por uma pessoa não é trocado.",
+                )}
+              </p>
+            </div>
+            <Switch
+              checked={config.replace_live_flow === true}
+              onCheckedChange={(v) => onChange({ ...config, replace_live_flow: v ? true : undefined })}
+            />
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * `apply_task_plan` (#1752) — o seletor dos planos CADASTRADOS.
+ *
+ * A lista vem da MESMA rota que a tela Tarefas › Planos grava
+ * (`settings/task-plans`), e é o motor quem a filtra: o que aparece aqui é
+ * exatamente o que `lib/tarefas/plano.ts` aplicaria. Um `plano_id` escrito à
+ * mão (regra criada pela API) morreria como `plano_nao_encontrado` em cada
+ * disparo — o seletor existe para que isso só aconteça se o plano for apagado
+ * DEPOIS de a regra estar pronta.
+ */
+function ApplyTaskPlanForm({ config, onChange }: FormProps<{ plano_id: string }>) {
+  const t = useT();
+  const { data, isLoading } = useQuery({
+    queryKey: ["settings", "task-plans"],
+    queryFn: async () =>
+      (
+        await apiClient.get<{ data: { planos: PlanoDeTarefas[] } }>(
+          "/api/v1/settings/task-plans",
+        )
+      ).data,
+  });
+  const planos = data?.planos ?? [];
+
+  return (
     <div className="space-y-1">
-      <Label>{t("Fluxo de follow-up")}</Label>
+      <Label>{t("Plano de tarefa")}</Label>
       <Select
-        value={config.flow_pointer_id}
-        onValueChange={(v) => onChange({ flow_pointer_id: v })}
+        value={config.plano_id}
+        onValueChange={(v) => onChange({ plano_id: v })}
         disabled={isLoading}
       >
         <SelectTrigger>
-          <SelectValue placeholder={t("Escolha um fluxo publicado")} />
+          <SelectValue placeholder={t("Escolha um plano cadastrado")} />
         </SelectTrigger>
         <SelectContent>
-          {active.map((f) => (
-            <SelectItem key={f.id} value={f.id}>
-              {f.name}
+          {planos.map((p) => (
+            <SelectItem key={p.id} value={p.id}>
+              {p.nome}
             </SelectItem>
           ))}
         </SelectContent>
       </Select>
-      {!isLoading && active.length === 0 ? (
+      {/* Carregando não diz nada: a frase abaixo só é verdade quando a lista
+          JÁ chegou, e um aviso de "nenhum plano" durante o carregamento ensina
+          o operador a desistir antes de a resposta chegar. */}
+      {isLoading ? null : planos.length === 0 ? (
         <p className="text-xs text-muted-foreground">
-          {t("Nenhum fluxo ativo. Publique um follow-up em Follow-ups para usá-lo aqui.")}
+          {t("Nenhum plano cadastrado ainda. Cadastre em Tarefas › Planos.")}
         </p>
       ) : (
         <p className="text-xs text-muted-foreground">
-          {t("Só entram fluxos publicados e ativos.")}
+          {t(
+            "Cada aplicação cria as tarefas do plano na ordem e não duplica — a marca da aplicação é a prova.",
+          )}
         </p>
       )}
+    </div>
+  );
+}
+
+/**
+ * `set_lead_date_field` (#3727) — a data do comparecimento vai para um campo de
+ * DATA do negócio, e quem conta os dias é o gatilho de data do funil (#989).
+ *
+ * As duas escolhas são as MESMAS do `trigger_config` daquele gatilho — funil e
+ * chave do campo —, e a lista de campos é a `camposDeDataDoNegocio`, nunca
+ * `camposDoFunil`: campo de data do CONTATO mora em `contacts.custom_fields` e a
+ * varredura só lê o negócio, então oferecê-lo aqui gravaria num lugar que
+ * ninguém consulta (a recusa do servidor diria o mesmo, depois do save).
+ *
+ * A frase de baixo é o que o operador precisa saber e o formulário não pode
+ * dizer sozinho: o PRAZO não mora aqui. Quem escreve N é a regra de data, com N
+ * NEGATIVO para "depois" — e é isso que faz um único campo servir à manutenção
+ * de 4 meses e à de 6.
+ */
+function SetLeadDateFieldForm({
+  config,
+  onChange,
+}: FormProps<{ pipeline_id: string; campo: string }>) {
+  const t = useT();
+  const { data: pipelinesRes, isLoading } = usePipelines();
+  const pipelines = pipelinesRes?.data ?? [];
+  const funil = pipelines.find((p) => p.id === config.pipeline_id) ?? null;
+  const campos = camposDeDataDoNegocio(funil?.settings ?? null);
+
+  return (
+    <div className="grid gap-2 sm:grid-cols-2">
+      <div className="space-y-1">
+        <Label>{t("Funil")}</Label>
+        <Select
+          value={config.pipeline_id}
+          onValueChange={(v) => onChange({ pipeline_id: v, campo: "" })}
+          disabled={isLoading}
+        >
+          <SelectTrigger aria-label={t("Funil")}>
+            <SelectValue placeholder={t("Escolha o funil")} />
+          </SelectTrigger>
+          <SelectContent>
+            {pipelines.map((p) => (
+              <SelectItem key={p.id} value={p.id}>
+                {p.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="space-y-1">
+        <Label>{t("Campo de data")}</Label>
+        <Select
+          value={config.campo}
+          onValueChange={(v) => onChange({ ...config, campo: v })}
+          disabled={!config.pipeline_id}
+        >
+          <SelectTrigger aria-label={t("Campo de data")}>
+            <SelectValue
+              placeholder={config.pipeline_id ? t("Escolha o campo") : t("Escolha o funil primeiro")}
+            />
+          </SelectTrigger>
+          <SelectContent>
+            {campos.map((campo) => (
+              <SelectItem key={campo.key} value={campo.key}>
+                {campo.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      <p className="text-xs text-muted-foreground sm:col-span-2">
+        {t(
+          "Grava a data do atendimento neste campo. Quem conta os dias é a regra “Quando faltarem N dias para uma data do funil”, com N negativo para agir depois do atendimento.",
+        )}
+      </p>
+      {config.pipeline_id && campos.length === 0 ? (
+        <p role="alert" className="text-xs text-destructive sm:col-span-2">
+          {t("Este funil não tem campo de data do negócio. Crie um nas configurações do funil para usar esta ação.")}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * `notify_team` (#2642) — o formulário do aviso que NUNCA vai para o lead.
+ *
+ * Depois do recorte do PR #2834 não há escolha nenhuma aqui: o resumo vai para
+ * o WhatsApp que o ADMIN cadastrou em Avisos, e o corpo é montado no disparo
+ * só com dado de forma fixa e o atalho para a ficha. O formulário NÃO
+ * oferece destino colado, pessoa nem texto — um campo de texto seria um
+ * template, que é exatamente o defeito do aviso de caso que esta ação fecha, e
+ * "quem recebe" virou pergunta sem resposta útil (o destino é o da empresa).
+ *
+ * O e-mail para uma pessoa da equipe mora no `send_email`, no destinatário
+ * "E-mail de uma pessoa da equipe".
+ */
+function NotifyTeamForm() {
+  const t = useT();
+  return (
+    <div className="space-y-1">
+      <Label>{t("WhatsApp da equipe")}</Label>
+      <p className="text-xs text-muted-foreground">
+        {t("Vai para o WhatsApp cadastrado em Avisos.")}{" "}
+        {t(
+          "O resumo leva o nome da regra, o cliente, o telefone, o valor, a pontuação e um atalho para o negócio no CRM (quando a instalação tem endereço público). O que foi conversado com o cliente não vai na mensagem.",
+        )}
+      </p>
     </div>
   );
 }
@@ -561,6 +1729,13 @@ export function ActionConfigForm({
     case "send_whatsapp_message":
       return (
         <SendWhatsappForm
+          config={action.config}
+          onChange={(config) => onChange({ type: action.type, config })}
+        />
+      );
+    case "send_email":
+      return (
+        <SendEmailForm
           config={action.config}
           onChange={(config) => onChange({ type: action.type, config })}
         />
@@ -607,5 +1782,21 @@ export function ActionConfigForm({
           onChange={(config) => onChange({ type: action.type, config })}
         />
       );
+    case "apply_task_plan":
+      return (
+        <ApplyTaskPlanForm
+          config={action.config}
+          onChange={(config) => onChange({ type: action.type, config })}
+        />
+      );
+    case "set_lead_date_field":
+      return (
+        <SetLeadDateFieldForm
+          config={action.config}
+          onChange={(config) => onChange({ type: action.type, config })}
+        />
+      );
+    case "notify_team":
+      return <NotifyTeamForm />;
   }
 }

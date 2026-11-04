@@ -22,9 +22,16 @@ import type { PlataformaDeAnuncio } from "@/lib/plataformas-de-anuncio/types";
 
 export interface AtribuicaoParaEnvio {
   plataforma: PlataformaDeAnuncio;
-  /** `ad_source_id` — o `ctwa_clid`, o clique que abriu a conversa. */
+  /** `ad_source_id` — o clique que abriu a conversa: `ctwa_clid` ou o `fbclid`/`gclid` do formulário. */
   cliqueDeOrigem: string;
   telefone: string | null;
+  /**
+   * Presente quando o clique foi capturado na PÁGINA (formulário): a identidade
+   * que a plataforma casa é o `fbc`/`fbp` do navegador, e não o `ctwa_clid` da
+   * conversa. Vem de `source_metadata` — `ad_click_source: "site"` marca a
+   * captura, e as duas chaves são o que o formulário mandou.
+   */
+  identidadeDoNavegador?: { fbc: string | null; fbp: string | null };
   identificadoresGoogle?: IdentificadoresGoogle;
 }
 
@@ -63,6 +70,40 @@ export async function lerAtribuicao(
       : {};
 
   const clique = typeof meta.ad_source_id === "string" ? meta.ad_source_id.trim() : "";
+  const telefone = linha.phone_number ? linha.phone_number.replace(/\D/g, "") || null : null;
+
+  const fbc = typeof meta.fbc === "string" && meta.fbc.trim() !== "" ? meta.fbc.trim() : null;
+  const fbp = typeof meta.fbp === "string" && meta.fbp.trim() !== "" ? meta.fbp.trim() : null;
+
+  // Quem chegou pela PÁGINA é reportado SEM clique — o `ctwa_clid` é o formato
+  // do anúncio clique-pro-WhatsApp e não descreve este lead. Dois casos, um
+  // caminho só:
+  //
+  //  - a origem de site que a `main` já trata (link com UTM da Meta, sem
+  //    clique): a pessoa veio de um anúncio que levou à página, e a venda é
+  //    reportada pelo telefone;
+  //  - o FORMULÁRIO (#2317), marcado com `ad_click_source: "site"` na captura:
+  //    o clique veio da landing page, não de uma conversa, e a identidade é o
+  //    `fbc`/`fbp` do navegador, que segue junto para o transporte.
+  //
+  // O `cliqueDeOrigem` vazio é o que troca a identidade no transporte — é ele
+  // que faz o evento sair `system_generated` com `fbc`/`fbp` em vez de
+  // `business_messaging` com `ctwa_clid`.
+  const daPagina =
+    meta.ad_click_source === "site" ||
+    (!clique && meta.ad_platform === "site" && utmDaMeta(meta.utm_source));
+  if (daPagina) {
+    return {
+      temAtribuicao: true,
+      atribuicao: {
+        plataforma: "meta_ads",
+        cliqueDeOrigem: "",
+        telefone,
+        ...(fbc || fbp ? { identidadeDoNavegador: { fbc, fbp } } : {}),
+      },
+    };
+  }
+
   // Sem o clique não há atribuição utilizável: é ele que liga a venda ao anúncio.
   // Ter `ad_platform` sem `ad_source_id` acontece quando o payload trouxe o
   // referral sem o identificador — a 0164 grava os dois como vieram.
@@ -92,7 +133,24 @@ export async function lerAtribuicao(
       cliqueDeOrigem: clique,
       // Só dígitos: a plataforma exige E.164 sem `+` nem separadores ANTES do
       // hash. Normalizar depois do hash seria tarde — o hash já estaria errado.
-      telefone: linha.phone_number ? linha.phone_number.replace(/\D/g, "") || null : null,
+      telefone,
     },
   };
+}
+
+/**
+ * Os `utm_source` que significam "anúncio da Meta". Lista fechada e explícita:
+ * quem monta o link escolhe o texto, e casar por "contém face" pegaria
+ * `facebook_organico` e mandaria venda orgânica para a conta de anúncios.
+ */
+export const UTM_SOURCES_DA_META: ReadonlySet<string> = new Set([
+  "meta",
+  "facebook",
+  "fb",
+  "instagram",
+  "ig",
+]);
+
+function utmDaMeta(valor: unknown): boolean {
+  return typeof valor === "string" && UTM_SOURCES_DA_META.has(valor.trim().toLowerCase());
 }

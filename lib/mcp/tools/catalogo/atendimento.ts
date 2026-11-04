@@ -14,6 +14,29 @@
 import { declararTools } from "./tipos";
 
 export const TOOLS_ATENDIMENTO = declararTools([
+  // ── `risco` DESTAS DUAS REAVALIADO (#2158) ────────────────────────────────
+  //
+  // Medido contra a convenção que JÁ EXISTE, em `RISCOS`
+  // (`lib/mcp/tools/pacotes.ts`) — nenhum rótulo novo inventado:
+  //
+  //   "seguro"   = "Só consulta. O agente apenas lê a informação. Nada muda
+  //                no sistema."
+  //   "atencao"  = "Altera dados. O agente muda alguma coisa no sistema…"
+  //   "critico"  = "Efeito que não dá para desfazer…" — e ainda por cima sai
+  //                do pacote (`entraPorPacote`), exigindo marcação humana.
+  //
+  // As duas são leituras puras: mudá-las para "atencao" seria mentira no outro
+  // sentido ("altera dados" — não altera), e "critico" as tiraria do pacote
+  // Atender, que existe justamente para o agente saber com quem está falando.
+  // O que a issue apontava — o rótulo prometia mais do que o runtime entregava
+  // — passou a ser verdade DO LADO DO RUNTIME: em conversa, o escopo do contato
+  // do turno alcança a leitura também (#2158, `lib/mcp/tools/contacts.ts`).
+  //
+  // Fica registrado o limite da convenção: `risco` é POR FERRAMENTA, não por
+  // pacote, então não existe "seguro no vender / atencao no atender" para
+  // declarar — e a taxa de exposição de dado pessoal (leitura que devolve
+  // telefone/e-mail) não tem slot em `RISCOS`. Se um dia tiver, esta dupla é a
+  // primeira candidata.
   {
     name: "crm_search_contacts",
     category: "read",
@@ -31,6 +54,7 @@ export const TOOLS_ATENDIMENTO = declararTools([
     explicacao:
       "Abre a ficha completa de um cliente: dados de contato, histórico e por onde ele chegou até a empresa.",
     oQueToca: "Cadastro de clientes",
+    // Ver o bloco acima: mesma leitura, mesma conclusão (#2158).
     risco: "seguro",
     pacotes: ["atender", "vender"],
   },
@@ -49,11 +73,17 @@ export const TOOLS_ATENDIMENTO = declararTools([
     // Nenhum dos dois gerou conflito de texto — o `tsc` é que reprovou no merge.
     rotulo: "Anotar dado que o cliente informou",
     explicacao:
-      "Quando o cliente diz o e-mail, o nome ou o telefone dele na conversa, guarda essa informação para uma pessoa conferir antes de entrar na ficha.",
+      "Guarda o dado informado para revisão humana. A empresa pode permitir, em Configurações › Distribuição " +
+      "de atendimento, preencher telefone vazio ou nome vazio. Nome exige mensagem real do próprio contato " +
+      "neste atendimento; nome preexistente diferente e e-mail continuam aguardando confirmação.",
     oQueToca: "Cadastro de clientes",
-    // `atencao`, não `critico`: nada sai para o cliente e nada entra na ficha
-    // por conta dela — o peso mora na confirmação, que é humana. Marcar
-    // `critico` aqui faria a tela pedir cerimônia para uma anotação.
+    // `atencao`, não `critico`: nada sai para o cliente, e os ÚNICOS dados que
+    // entram na ficha por conta desta ferramenta são o telefone de um cadastro
+    // SEM número (#2593) e o nome de um cadastro SEM nome (#3784) — sozinhos,
+    // sem sobrescrever nada, com auditoria e rastro na linha do tempo, E SÓ COM
+    // A OPÇÃO DA ORGANIZAÇÃO LIGADA (as duas vêm desligadas). O resto continua
+    // esperando a confirmação humana, que é onde o peso mora. Marcar `critico`
+    // aqui faria a tela pedir cerimônia para uma anotação.
     risco: "atencao",
     // ⚠️ FORA de "atender", e a razão é o TETO — não o valor da capacidade.
     //

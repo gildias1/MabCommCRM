@@ -61,6 +61,8 @@ import { ActionNode } from "./nodes/ActionNode";
 import { EndNode } from "./nodes/EndNode";
 import { CollectNode } from "./nodes/CollectNode";
 import { InternalTaskNode } from "./nodes/InternalTaskNode";
+import { MoveLeadNode } from "./nodes/MoveLeadNode";
+import { EditLeadTagNode } from "./nodes/EditLeadTagNode";
 import { SkillNode } from "./nodes/SkillNode";
 
 const EMPTY_GRAPH: FlowGraph = { nodes: [], edges: [] };
@@ -81,6 +83,11 @@ const nodeTypes: NodeTypes = {
   // rótulo e sem formulário. Completar o nó é esta linha mais o formulário do
   // painel (`forms/InternalTaskForm`).
   internal_task: InternalTaskNode,
+  // #2065 — as duas caixas novas da issue: sem estas linhas o React Flow cai
+  // no fallback da caixa desconhecida (o mesmo defeito do #1540 medido ali em
+  // cima), sem rótulo e sem formulário.
+  move_lead: MoveLeadNode,
+  edit_lead_tag: EditLeadTagNode,
   end: EndNode,
   collect: CollectNode,
   skill: SkillNode,
@@ -401,7 +408,7 @@ function FlowCanvasInner({ flowId, initialData }: Props) {
         */}
         {selectedNode && (
           <aside
-            className="fixed inset-x-0 bottom-0 z-40 flex max-h-[75vh] flex-col overflow-hidden rounded-t-lg border-t border-border bg-surface shadow-lg lg:static lg:z-auto lg:h-full lg:w-96 lg:max-h-none lg:shrink-0 lg:rounded-none lg:border-l lg:border-t-0 lg:shadow-none"
+            className="fixed inset-x-0 bottom-[var(--rodape-ocupado,0px)] z-40 flex max-h-[75vh] flex-col overflow-hidden rounded-t-lg border-t border-border bg-surface shadow-lg lg:static lg:z-auto lg:h-full lg:w-96 lg:max-h-none lg:shrink-0 lg:rounded-none lg:border-l lg:border-t-0 lg:shadow-none"
             data-testid="node-config-sheet"
           >
             {/* Barra própria pro X, não sobreposta ao conteúdo — um botão
@@ -436,7 +443,7 @@ function FlowCanvasInner({ flowId, initialData }: Props) {
 
         {selectedEdge && (
           <aside
-            className="fixed inset-x-0 bottom-0 z-40 flex max-h-[75vh] flex-col overflow-hidden rounded-t-lg border-t border-border bg-surface shadow-lg lg:static lg:z-auto lg:h-full lg:w-96 lg:max-h-none lg:shrink-0 lg:rounded-none lg:border-l lg:border-t-0 lg:shadow-none"
+            className="fixed inset-x-0 bottom-[var(--rodape-ocupado,0px)] z-40 flex max-h-[75vh] flex-col overflow-hidden rounded-t-lg border-t border-border bg-surface shadow-lg lg:static lg:z-auto lg:h-full lg:w-96 lg:max-h-none lg:shrink-0 lg:rounded-none lg:border-l lg:border-t-0 lg:shadow-none"
             data-testid="edge-config-sheet"
           >
             <div className="flex shrink-0 justify-end p-2 lg:hidden">

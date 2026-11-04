@@ -9,7 +9,8 @@
  *     (organization_id, source_event_id) em job_queue com captura de 23505;
  *   - coalescência de rajada: mensagens do MESMO contato dentro da janela de
  *     debounce viram UM job (o turno lê o histórico completo e responde a todas);
- *   - grupos @g.us: skip (regra dura nº 12) — evento marcado done sem job;
+ *   - grupos @g.us: skip (regra dura nº 12), exceto quando a chave POR GRUPO
+ *     `ia_responde` liberou a IA (#2729) — evento marcado done sem job;
  *   - eventos 'processing' órfãos (crash do worker) voltam a 'pending' por timeout.
  */
 import { z } from 'zod';
@@ -19,12 +20,23 @@ import { loadConversationAgentConfig } from '../../agent/agent-config';
 import { insertInboxItem } from '../../db/repository';
 import type { Logger } from '../../obs/logger';
 import { enqueueJob } from '../../queue/queue';
+import { janelaDeRespostaAberta, soltarAdiadoPelaJanela } from '../../pacing/adiados-da-janela';
 import { decidirRajada, debounceEfetivo } from './debounce';
+import {
+  intervaloEfetivo,
+  runAfterComIntervalo,
+  ultimaRespostaDaIa,
+} from './intervalo-entre-respostas';
 import { avisoDeEventoMorto, IA_QUE_NAO_RESPONDEU } from '@/lib/event-log/aviso-de-evento-morto';
-import { TIPOS_DERIVAVEIS, DERIVACAO_TERMINADA } from '@/lib/messaging/media/derivable';
+import { acordarLacoDeEventLog } from '@/lib/event-log/sinal-de-trabalho';
+import { canalDesativado } from '@/lib/channels/desativado';
+import { TETO_DA_ESPERA_DA_DERIVACAO_MS } from '@/lib/messaging/media/derivable';
+import { midiaDerivavelPendente } from './midia-derivavel';
 import { haQuemAtendaASessao } from '@/lib/ai/agents/quem-atende-a-sessao';
 import { decidirElegibilidadeDaConversa } from '@/lib/ai/elegibilidade/consulta-pg';
 import { deveCederTurnoAoRetorno } from '@/lib/followup/ceder-turno-ao-retorno';
+import { grupoLiberaIa } from '@/lib/grupos/ia-no-grupo';
+import { ehOperante } from '@/lib/organizacao/operante';
 
 const DRAIN_CONSUMER = 'agent-engine';
 
@@ -59,6 +71,21 @@ export interface DrainKnobs {
    * testes que não exercitam o gate — o default de 21 dias em ms é aplicado.
    */
   allowlistTtlMs?: number;
+  /**
+   * Relógio da janela de RESPOSTA (#3383). Só é usado na pergunta "a janela
+   * está aberta AGORA?" que o drain faz quando achar um job adiado esperando
+   * carona — e é justamente aí que o teste precisa fixar a hora (22h11 para a
+   * janela 7h–22h fechada) sem depender do relógio de parede do runner.
+   * Ausente = `new Date()`.
+   */
+  clock?: () => Date;
+  /**
+   * Avisa o laço da fila que há job NOVO — corta a soneca dele (#3688). O drain
+   * roda no MESMO worker do laço, então o aviso é uma promessa local, não fila
+   * nem polling. Ausente onde não há laço para acordar (CLI, testes): quem
+   * enfileira não pode depender de existir alguém dormindo.
+   */
+  acordarFila?: () => void;
 }
 
 /** Default de `allowlistTtlMs` (21 dias) para testes que omitem o knob. */
@@ -66,7 +93,9 @@ const ALLOWLIST_TTL_MS_PADRAO = 21 * 24 * 60 * 60 * 1000;
 
 /** Um tick do drain: claima um lote de eventos e os transforma em jobs. */
 export async function drainTick(pool: pg.Pool, knobs: DrainKnobs, log: Logger): Promise<number> {
-  // Reaper de eventos órfãos — barato (update indexado), roda a cada tick.
+  // Reaper de eventos órfãos, a cada tick. Quem o serve é o parcial
+  // `event_log_processing_por_tipo_idx` (event_type where status='processing',
+  // migration 0585); o `= any(consumed_by)` é filtro e não usa o GIN.
   await pool.query(
     `update event_log set status = 'pending', updated_at = now()
      where event_type = 'ai_agent.dispatch_requested'
@@ -180,22 +209,6 @@ async function avisarDespachoMorto(
 
 /** Quanto esperar entre uma checagem e outra da derivação de mídia. */
 const ESPERA_DERIVACAO_MS = 4_000;
-/**
- * Teto da espera. Passado isto o turno segue SEM o texto derivado: melhor uma
- * resposta tarde e sem transcrição do que cliente esperando para sempre porque
- * a derivação travou.
- *
- * Era 45s até 2026-09-03, quando um áudio real (cliente "Alfran") levou ~86s
- * para transcrever: o turno estourou o teto, respondeu "não consegui ouvir
- * seu áudio" às 14:25:46, e a transcrição correta só ficou pronta às 14:26:04
- * — 18s tarde demais, e o cliente teve que digitar a pergunta de novo.
- * Medição de p50/p90/p99 de conclusão de transcrição nos últimos 7 dias desta
- * instalação: 14s / 407s / 2538s — a cauda longa (minutos) é de retry após
- * falha transitória, não do Whisper em si, e nenhum teto razoável a cobre sem
- * o cliente esperando minutos pela primeira resposta. 120s cobre o caso comum
- * de transcrição lenta (como o do Alfran) sem impor essa espera longa.
- */
-const TETO_ESPERA_DERIVACAO_MS = 120_000;
 
 type DesfechoEvento = 'processado' | 'adiar';
 
@@ -214,13 +227,13 @@ type DesfechoEvento = 'processado' | 'adiar';
  * Falha da consulta NÃO derruba o evento: degrada para a env, como a checagem
  * de elegibilidade acima. A janela é afinação, não motivo para retry.
  */
-async function debounceDoEvento(
+async function ajustesDoAgenteDoEvento(
   pool: pg.Pool,
   event: EventRow,
   p: { conversation_id: string; channel_session_id: string },
   padraoInstalacao: number,
   log: Logger,
-): Promise<number> {
+): Promise<{ debounceMs: number; intervaloEntreRespostasMs: number }> {
   try {
     const agentConfig = await loadConversationAgentConfig(
       pool,
@@ -228,13 +241,17 @@ async function debounceDoEvento(
       p.conversation_id,
       p.channel_session_id,
     );
-    return debounceEfetivo(agentConfig?.inboundDebounceMs ?? null, padraoInstalacao);
+    return {
+      debounceMs: debounceEfetivo(agentConfig?.inboundDebounceMs ?? null, padraoInstalacao),
+      // O intervalo entre respostas vem da MESMA versão do agente (mesma consulta).
+      intervaloEntreRespostasMs: intervaloEfetivo(agentConfig?.replyMinIntervalMs ?? null),
+    };
   } catch (err) {
-    log.warn('drain: janela de rajada do agente não resolveu — usando a da instalação', {
+    log.warn('drain: ajustes do agente não resolveram — usando a janela da instalação, sem intervalo', {
       event_id: event.id,
       error: (err instanceof Error ? err.message : String(err)).slice(0, 160),
     });
-    return padraoInstalacao;
+    return { debounceMs: padraoInstalacao, intervaloEntreRespostasMs: 0 };
   }
 }
 
@@ -255,25 +272,68 @@ async function processEvent(
   }
   const p = parsed.data;
 
-  // Spec 14: org em modo 'external' tem agente EXTERNO como dono da conversa —
-  // o engine não responde por cima. Evento é consumido (done) sem job.
-  const { rows: modeRows } = await pool.query<{ mode: string | null }>(
-    `select settings->>'ai_dispatch_mode' as mode from organizations where id = $1`,
+  // Organização parada (suspensa, redigida, arquivada) não gera turno: o evento
+  // é consumido sem job. Vai na MESMA consulta do modo externo — uma ida ao banco
+  // por evento, não duas — e vem ANTES do `canAssist`, que desliga o gate.
+  const { rows: modeRows } = await pool.query<{ mode: string | null; status: string | null }>(
+    `select settings->>'ai_dispatch_mode' as mode, status from organizations where id = $1`,
     [event.organization_id],
   );
+  if (!ehOperante(modeRows[0]?.status)) {
+    log.info('drain: organização não operante — evento consumido sem job', { event_id: event.id });
+    return 'processado';
+  }
+  // Spec 14: org em modo 'external' tem agente EXTERNO como dono da conversa —
+  // o engine não responde por cima. Evento é consumido (done) sem job.
   if (modeRows[0]?.mode === 'external') {
     log.info('drain: org em modo external (spec 14) — evento pulado', { event_id: event.id });
     return 'processado';
   }
 
-  // Grupos: skip, sem exceção (regra dura nº 12).
-  const { rows: convRows } = await pool.query<{ is_group: boolean }>(
-    'select is_group from conversations where organization_id = $1 and id = $2',
+  // Canal desativado pelo operador: defesa em profundidade do `pedirDespachoDoAgente`
+  // (que já não emite para desativado). Evento antigo em voo ou emit direto cai
+  // aqui e é consumido sem job, antes de qualquer custo.
+  if (p.channel_session_id) {
+    const { rows: canalRows } = await pool.query<{ metadata: unknown }>(
+      'select metadata from channel_sessions where organization_id = $1 and id = $2',
+      [event.organization_id, p.channel_session_id],
+    );
+    const meta = canalRows[0]?.metadata;
+    if (canalDesativado(meta)) {
+      log.info('drain: canal desativado — evento consumido sem job', { event_id: event.id });
+      return 'processado';
+    }
+  }
+
+  // Grupos: skip, com UMA exceção estreita (regra dura nº 12 + #2729) — o
+  // evento marcado done sem job continua sendo o padrão de 100% das
+  // instalações.
+  // A consulta já traz a chave POR GRUPO (`channel_session_groups.ia_responde`)
+  // junto do `is_group`, por um LEFT JOIN no MESMO select: é a leitura que o
+  // ingest do grupo também faz, e a régua que decide é a MESMA função
+  // (`grupoLiberaIa`, `=== true`, falha fechada) — divergência entre as duas
+  // leituras é como a régua local do worker já passou a discordar da tela em
+  // produção (ver `pos-entrada.ts`). Conversa sem linha na fila (LEFT JOIN sem
+  // par) chega com `ia_responde` nulo, que é "não sei se liberaram" — e não sei
+  // não responde.
+  const { rows: convRows } = await pool.query<{ is_group: boolean; ia_responde: boolean | null }>(
+    `select c.is_group, g.ia_responde
+       from conversations c
+       left join channel_session_groups g
+         on g.organization_id = c.organization_id
+        and g.channel_session_id = c.channel_session_id
+        and g.group_chat_id = c.group_chat_id
+      where c.organization_id = $1 and c.id = $2`,
     [event.organization_id, p.conversation_id],
   );
   if (convRows[0]?.is_group !== false) {
-    log.info('drain: conversa de grupo ou inexistente — evento pulado', { event_id: event.id });
-    return 'processado';
+    if (!grupoLiberaIa(convRows[0]?.ia_responde)) {
+      log.info('drain: conversa de grupo sem a chave da IA liberada — evento pulado', { event_id: event.id });
+      return 'processado';
+    }
+    log.info('drain: grupo liberado pela chave por grupo (#2729) — turno segue o caminho normal', {
+      event_id: event.id,
+    });
   }
 
   // Ninguém para atender: NÃO gastar. Sem agente publicado para esta sessão e
@@ -431,45 +491,41 @@ async function processEvent(
   // COMPROVANTE e escreve "já paguei, e vocês estão me cobrando". A evidência e
   // a alegação chegam em mensagens separadas, e o turno precisa das duas.
   //
-  // A âncora do teto passou a ser a hora DA MÍDIA, não a do evento: é a idade
-  // da derivação que diz se ainda vale esperar. Mídia antiga e travada não segura
-  // o turno para sempre — sai do teto e o turno segue com o marcador `[tipo]`.
-  //
-  // E a hora da mídia é `created_at` — quando ELA CHEGOU A NÓS —, nunca
-  // `sent_at`. No inbound, `sent_at` é o timestamp do WhatsApp, o relógio do
-  // aparelho (a ingestão do canal, `dataDoTimestamp(p.timestamp)`): uma foto
-  // entregue com atraso (aparelho offline, canal reconectando) nasceria "além do
-  // teto" e o turno seguiria sem esperar a leitura que acabou de começar.
-  //
-  // `media_url is not null` é a pré-condição de TODA a esteira: sem ela o
-  // `media.persist_requested` nem é emitido, a derivação nunca é pedida e o
-  // status fica null para sempre — esperar por ela só atrasaria a resposta.
-  const { rows: midias } = await pool.query<{
-    type: string;
-    media_derived_status: string | null;
-    quando: string;
-  }>(
-    `select type, media_derived_status, created_at as quando
-       from messages
-      where organization_id = $1
-        and conversation_id = $2
-        and direction = 'inbound'
-        and type = any($3::text[])
-        and media_url is not null
-      order by created_at desc
-      limit 20`,
-    [event.organization_id, p.conversation_id, [...TIPOS_DERIVAVEIS]],
-  );
-  // A mais RECENTE que ainda não terminou: é ela que o turno não pode perder.
-  const midia = midias.find((m) => !DERIVACAO_TERMINADA.has(m.media_derived_status ?? ''));
-  if (midia !== undefined) {
+  // A consulta em si (tipos deriváveis, `media_url is not null`, status fora de
+  // `DERIVACAO_TERMINADA`) mora em `./midia-derivavel.ts`, porque o TURNO faz a
+  // mesma pergunta antes de montar o prompt (#3836) e as duas não podem
+  // discordar. O que fica aqui é a POLÍTICA do despacho: a âncora do teto é a
+  // hora DA MÍDIA (`created_at`, quando ela chegou a nós — nunca `sent_at`, o
+  // relógio do aparelho, que faria uma foto entregue com atraso nascer "além do
+  // teto"), e mídia velha e travada não segura o turno para sempre.
+  const midia = await midiaDerivavelPendente(pool, {
+    organizationId: event.organization_id,
+    conversationId: p.conversation_id,
+  });
+  if (midia !== null) {
     const esperandoHa = Date.now() - new Date(midia.quando).getTime();
-    if (esperandoHa < TETO_ESPERA_DERIVACAO_MS) {
+    if (esperandoHa < TETO_DA_ESPERA_DA_DERIVACAO_MS) {
       log.info('drain: mídia ainda sendo transcrita — turno adiado', {
         event_id: event.id,
         tipo: midia.type,
         esperando_ha_ms: esperandoHa,
       });
+      // ACORDA o laço do `event_log` — o que roda `media.persist_requested` e
+      // `media.derive_requested`, isto é, quem faz a transcrição acontecer.
+      //
+      // É daqui porque este é o único ponto DENTRO do worker que sabe que a
+      // derivação está pendente: os dois laços sobem no mesmo processo
+      // (`workers/agent-worker/main.ts`), então um `import` basta — sem
+      // LISTEN/NOTIFY, sem conexão nova por worker. O ingest do canal, que
+      // escreve `media.persist_requested`, roda em OUTRO processo (a rota HTTP
+      // do webhook) e continua limitado pelo teto do recuo; acordar de lá é o
+      // que ficaria para um LISTEN/NOTIFY, fora deste PR.
+      //
+      // Sem isto, o laço do event_log dorme até o teto do recuo (30s por
+      // default) e um áudio lento (86s medidos) chega a 116 dos 120s deste
+      // turno; com teto maior passa, e o cliente ouve "não consegui ouvir seu
+      // áudio", o defeito que fez o teto subir de 45s para 120s.
+      acordarLacoDeEventLog();
       return 'adiar';
     }
     log.warn('drain: derivação não concluiu no teto — seguindo sem o texto', {
@@ -484,10 +540,21 @@ async function processEvent(
   //
   // A janela e a exclusão do job em HOLD (`held_run_after` no payload — a lição
   // do #830) moram em ./debounce.ts, com teste próprio.
+  const ajustes = await ajustesDoAgenteDoEvento(pool, event, p, knobs.debounceMs, log);
   const rajada = await decidirRajada(
     pool,
     { organizationId: event.organization_id, contactId: p.contact_id },
-    await debounceDoEvento(pool, event, p, knobs.debounceMs, log),
+    ajustes.debounceMs,
+    Date.now(),
+    // Só é chamada quando o candidato à carona está adiado pela janela (#3383),
+    // uma consulta por mensagem nesse caso — nenhum custo no caminho comum.
+    () =>
+      janelaDeRespostaAberta(pool, {
+        organizationId: event.organization_id,
+        channelSessionId: p.channel_session_id,
+        agora: knobs.clock?.() ?? new Date(),
+        log,
+      }),
   );
   if (rajada.tipo === 'coalescido') {
     log.info('drain: rajada coalescida em job pendente', {
@@ -496,8 +563,51 @@ async function processEvent(
     });
     return 'processado';
   }
+  // #3383 — a janela JÁ ABRIU e este job ainda dormia até o horário antigo:
+  // ele não recebe a mensagem de carona (acima) e não continua adiado. O MESMO
+  // job acorda (`run_after = now()`), sem inserir nada — o turno dele roda uma
+  // vez, e a mensagem nova enfileira o próprio job logo abaixo.
+  //
+  // Falhar aqui NÃO derruba o evento: a mensagem nova continua sendo
+  // enfileirada e respondida; o adiado fica para o próximo acordamento (ou
+  // para a abertura calculada), com o warn dizendo o que não aconteceu.
+  if (rajada.caronaRecusadaEm !== undefined) {
+    let acordado = false;
+    try {
+      acordado = await soltarAdiadoPelaJanela(pool, rajada.caronaRecusadaEm);
+    } catch (err) {
+      log.warn('drain: não consegui acordar o job adiado com a janela aberta', {
+        event_id: event.id,
+        job_id: rajada.caronaRecusadaEm,
+        error: (err instanceof Error ? err.message : String(err)).slice(0, 160),
+      });
+    }
+    log.info('drain: job adiado pela janela não recebe carona — mensagem enfileirada à parte', {
+      event_id: event.id,
+      job_id: rajada.caronaRecusadaEm,
+      acordado,
+    });
+  }
 
-  const runAfter = rajada.runAfter;
+  // Intervalo mínimo entre respostas da IA (por agente): o turno só nasce
+  // depois de `última resposta da IA + intervalo`. Falha da consulta NÃO derruba
+  // o evento — o intervalo é afinação, e o cliente que espera resposta não paga
+  // por ela: degrada para o `run_after` da rajada.
+  let runAfter = rajada.runAfter;
+  if (ajustes.intervaloEntreRespostasMs > 0) {
+    try {
+      const ultima = await ultimaRespostaDaIa(pool, {
+        organizationId: event.organization_id,
+        conversationId: p.conversation_id,
+      });
+      runAfter = runAfterComIntervalo(runAfter, ultima, ajustes.intervaloEntreRespostasMs);
+    } catch (err) {
+      log.warn('drain: não consegui medir o intervalo entre respostas — turno sem espera extra', {
+        event_id: event.id,
+        error: (err instanceof Error ? err.message : String(err)).slice(0, 160),
+      });
+    }
+  }
   const { job, deduped } = await enqueueJob(pool, event.organization_id, {
     kind: 'inbound_turn',
     leadId: p.contact_id,
@@ -512,7 +622,72 @@ async function processEvent(
     ...(runAfter !== undefined ? { runAfter } : {}),
   });
   log.info('drain: job de turno enfileirado', { event_id: event.id, job_id: job.id, deduped });
+  // A soneca do laço da fila sai na hora (#3688): sem este aviso o job esperaria
+  // até o fim do teto do recuo (quando ligado), e é a PRIMEIRA resposta de um lead que escreveu
+  // depois de um período parado que paga a conta. Depois do enfileiramento, e só
+  // nele: avisar antes deixaria o laço consultar o relógio e não ver o job.
+  knobs.acordarFila?.();
   return 'processado';
+}
+
+/**
+ * Quantos ciclos OCIOSOS sem um tick CONCLUÍDO contam como "laço parado"
+ * (issue #2505).
+ *
+ * O default da instalação é `idle = 15s`, então 20 ciclos = **5 minutos**. A
+ * folga é dupla de propósito: o carimbo é do FIM do tick (um tick de lote cheio
+ * demora mais que o intervalo) e o custo de um falso positivo é um `/healthz`
+ * vermelho, que o operador investiga — contra o custo do falso negativo, que
+ * foi o do caso real: DOIS DIAS de laço travado com o worker dizendo `ok`
+ * (#2501), enquanto as mensagens se acumulavam com `attempts=0`.
+ */
+export const TICKS_PARA_PARADO = 20;
+
+/**
+ * O carimbo de vida do laço, lido de FORA dele (hoje: o `/healthz` do worker).
+ *
+ * `ultimoTickEm = null` significa "o laço ainda não começou" — não é parado,
+ * é um worker que acabou de subir; quem nunca deu a primeira volta não pode
+ * ser acusado de ter parado. `limiteMs` nasce do `idleIntervalMs` DA INSTALAÇÃO
+ * quando o laço começa, então um `.env` com intervalo maior ganha o mesmo
+ * número de ciclos de folga, não o mesmo relógio.
+ */
+interface VigilanciaDoDrain {
+  ultimoTickEm: number | null;
+  limiteMs: number | null;
+}
+const vigilancia: VigilanciaDoDrain = { ultimoTickEm: null, limiteMs: null };
+
+/** Resposta do `/healthz` sobre o laço do drain — nomes para a máquina. */
+export interface ProntidaoDoDrainDaIa {
+  /** Há quanto tempo o último tick concluiu; `null` = o laço não começou. */
+  ultimo_tick_ha_ms: number | null;
+  /** Limite em vigor (idle da instalação × `TICKS_PARA_PARADO`); `null` antes de começar. */
+  limite_ms: number | null;
+  /** `true` quando o carimbo passou do limite — o laço travou NO MEIO de um tick. */
+  parado: boolean;
+}
+
+/**
+ * Estado do laço para quem pergunta de fora. Nunca lança: o `/healthz` não pode
+ * ser o motivo de o worker cair — quem está degradado não ganha o direito de
+ * derrubar o resto.
+ *
+ * `agoraMs` é injetável para o teste medir o LIMITE sem esperar o relógio.
+ */
+export function prontidaoDoDrainDaIa(agoraMs: number = Date.now()): ProntidaoDoDrainDaIa {
+  const { ultimoTickEm, limiteMs } = vigilancia;
+  if (ultimoTickEm === null || limiteMs === null) {
+    return { ultimo_tick_ha_ms: null, limite_ms: limiteMs, parado: false };
+  }
+  const ha = Math.max(0, agoraMs - ultimoTickEm);
+  return { ultimo_tick_ha_ms: ha, limite_ms: limiteMs, parado: ha > limiteMs };
+}
+
+/** Só para teste: volta ao estado de "o laço ainda não começou". */
+export function _reiniciarVigilanciaDoDrain(): void {
+  vigilancia.ultimoTickEm = null;
+  vigilancia.limiteMs = null;
 }
 
 /** Loop do drain — polling com backoff adaptativo (ocioso = tick mais lento). */
@@ -522,6 +697,11 @@ export async function runDrainLoop(
   log: Logger,
   signal: AbortSignal,
 ): Promise<void> {
+  // O carimbo de vida (#2505): o limite nasce do intervalo ocioso DA INSTALAÇÃO
+  // e o carimbo é gravado quando o laço começa e ao FIM de cada volta — um tick
+  // que travar deixa o carimbo envelhecer, e é isso que o `/healthz` lê.
+  vigilancia.limiteMs = knobs.idleIntervalMs * TICKS_PARA_PARADO;
+  vigilancia.ultimoTickEm = Date.now();
   while (!signal.aborted) {
     let drained = 0;
     try {
@@ -531,6 +711,8 @@ export async function runDrainLoop(
         error: (err instanceof Error ? err.message : String(err)).slice(0, 300),
       });
     }
+    // O laço DEU A VOLTA — sucesso e erro capturado são a mesma prova de vida.
+    vigilancia.ultimoTickEm = Date.now();
     if (signal.aborted) break;
     // Lote CHEIO é sinal de backlog: há mais evento esperando do que caberia no
     // lote, e pagar o intervalo antes de voltar só empurra a fila para frente.

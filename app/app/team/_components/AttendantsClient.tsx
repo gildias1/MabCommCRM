@@ -12,6 +12,7 @@ import {
   useUpdateRouting,
   type AttendantAvailability,
 } from "@/hooks/team/useAttendants";
+import { useAssignSector, useSectors, type Sector } from "@/hooks/team/useSectors";
 import { estaDePlantao } from "@/lib/routing/eligibility";
 import {
   ROUTING_MODES,
@@ -54,13 +55,32 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Clock, Plus, Trash } from "@/lib/ui/icons";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { CaretDown, Clock, Copy, Plus, Trash } from "@/lib/ui/icons";
+import {
+  copiarParaDiasUteis,
+  podeCopiarParaDiasUteis,
+  resumoDaJornada,
+  ROTULOS_DOS_DIAS,
+} from "@/lib/agenda/editor-de-jornada";
+import { rotuloDoMembro } from "@/lib/users/rotulo-do-atendente";
 
-const DOW_LABELS = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
+/**
+ * Os rótulos da semana vêm de `lib/agenda/editor-de-jornada` — a MESMA fonte do
+ * resumo do que foi publicado. Duas listas aqui e ali seria o segundo rótulo
+ * para o mesmo dia, que é a segunda régua do mesmo número.
+ */
+const DOW_LABELS: readonly string[] = ROTULOS_DOS_DIAS;
 
 const MODE_LABELS: Record<(typeof ROUTING_MODES)[number], string> = {
   manual: "Manual (atendente puxa da fila)",
   round_robin: "Rodízio (distribui automático)",
+  load: "Menor carga (quem tem menos conversas na mão)",
 };
 
 interface Attendant {
@@ -68,6 +88,81 @@ interface Attendant {
   name: string;
   email: string | null;
   availability: AttendantAvailability;
+  /** FILAS da pessoa (migration 9062: N por atendente). Vazio = sem fila. */
+  sectorIds: string[];
+}
+
+/** Valor do filtro de setor: todos, sem setor, ou o id de um setor. */
+const TODOS_OS_SETORES = "__todos__";
+const SEM_SETOR = "__sem_setor__";
+
+/**
+ * O setor da pessoa, na mesma linha da jornada e da capacidade. Gerente escolhe
+ * na hora; quem só lê vê o nome. Setor apagado em outra aba não vira id cru na
+ * tela: sem nome conhecido, a célula diz "Sem setor", que é o que o banco diz
+ * depois do `on delete cascade` do vínculo.
+ */
+function SectorCell({
+  attendant,
+  sectors,
+  canManage,
+}: {
+  attendant: Attendant;
+  sectors: Sector[];
+  canManage: boolean;
+}) {
+  const t = useT();
+  const assign = useAssignSector();
+  const atuais = sectors.filter((s) => attendant.sectorIds.includes(s.id));
+  const rotulo = atuais.length === 0 ? t("Sem setor") : atuais.map((s) => s.name).join(", ");
+  if (!canManage) {
+    return <span className="text-sm">{rotulo}</span>;
+  }
+  if (sectors.length === 0) {
+    return <span className="text-xs text-muted-foreground">{t("Cadastre setores na aba Setores")}</span>;
+  }
+  // N setores por pessoa: um Select de valor único não consegue dizer "esta pessoa
+  // atende comercial E financeiro" — a célula virou lista de caixas. A troca é
+  // gravada a CADA clique (o conjunto inteiro vai junto), e o item não fecha o
+  // menu, para marcar duas filas custar dois cliques e não quatro.
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 w-[180px] justify-between font-normal"
+          disabled={assign.isPending}
+          aria-label={`${t("Setores de")} ${attendant.name}`}
+        >
+          <span className="truncate">{rotulo}</span>
+          <CaretDown className="h-3.5 w-3.5 shrink-0 opacity-60" aria-hidden />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-[220px]">
+        {sectors.map((s) => {
+          const marcado = attendant.sectorIds.includes(s.id);
+          return (
+            <DropdownMenuCheckboxItem
+              key={s.id}
+              checked={marcado}
+              onSelect={(event) => event.preventDefault()}
+              onCheckedChange={(marcar) =>
+                assign.mutate({
+                  userId: attendant.userId,
+                  sectorIds: marcar
+                    ? [...attendant.sectorIds, s.id]
+                    : attendant.sectorIds.filter((id) => id !== s.id),
+                })
+              }
+            >
+              {s.name}
+            </DropdownMenuCheckboxItem>
+          );
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
 }
 
 /**
@@ -86,6 +181,21 @@ interface Attendant {
  * o roteamento aceitando a qualquer hora — é dito por extenso no diálogo, onde
  * há espaço para as duas metades.
  */
+/**
+ * O fuso ao lado do resumo da jornada, só quando ele difere do da organização.
+ * A janela é avaliada no fuso de CADA pessoa (`schedule.timezone`), e quem lê a
+ * tabela pensa no da organização: "seg 08:00–18:00" de quem está em outro fuso
+ * é outro instante. Igual ao da organização, o sufixo seria ruído.
+ */
+export function fusoNoResumo(
+  windows: ScheduleWindow[],
+  fusoDaPessoa: string | undefined,
+  fusoDaOrganizacao: string | undefined,
+): string {
+  if (windows.length === 0 || !fusoDaPessoa || fusoDaPessoa === fusoDaOrganizacao) return "";
+  return ` (${fusoDaPessoa})`;
+}
+
 function summarizeSchedule(windows: ScheduleWindow[], t: (texto: string) => string): string {
   if (windows.length === 0) return t("Não publicado");
   return windows.map((w) => `${t(DOW_LABELS[w.dow] ?? "")} ${w.start}–${w.end}`).join(", ");
@@ -180,8 +290,21 @@ function PresenceBadge({ attendant }: { attendant: Attendant }) {
   );
 }
 
-/** Editor de janela de horário (schedule tz-aware) de um atendente. */
-function ScheduleDialog({
+/**
+ * Editor de janela de horário (schedule tz-aware) de um atendente.
+ *
+ * Duas peças da issue #2312 moram aqui, e as duas são respostas ao MESMO
+ * defeito — a pessoa achava que preencheu a semana e só a segunda foi gravada:
+ *
+ *   o BOTÃO copia as faixas do dia-modelo para os outros dias úteis
+ *   (`lib/agenda/editor-de-jornada`) — a semana deixa de ser digitação;
+ *
+ *   o RESUMO depois de salvar mostra o que SAIU GRAVADO, lido do retorno da
+ *   gravação, e o diálogo SÓ FECHA quando a pessoa pede — fechar no sucesso
+ *   transformaria o resumo num toast que ninguém lê, que é o mesmo silêncio
+ *   do bug.
+ */
+export function ScheduleDialog({
   attendant,
   open,
   onOpenChange,
@@ -192,7 +315,8 @@ function ScheduleDialog({
   attendant: Attendant;
   open: boolean;
   onOpenChange: (o: boolean) => void;
-  onSave: (windows: ScheduleWindow[], timezone: string) => void;
+  /** Devolve as janelas que o SERVIDOR guardou — é daqui que o resumo lê. */
+  onSave: (windows: ScheduleWindow[], timezone: string) => Promise<ScheduleWindow[]>;
   isPending: boolean;
   organizationTimezone?: string;
 }) {
@@ -201,6 +325,38 @@ function ScheduleDialog({
   const defaultTimezone = fusoOferecidoOuPadrao(organizationTimezone);
   const [timezone, setTimezone] = useState(initial?.timezone || defaultTimezone);
   const [windows, setWindows] = useState<ScheduleWindow[]>(initial?.windows ?? []);
+  /**
+   * O que o SERVIDOR guardou no último "Salvar", lido do RETORNO da gravação.
+   * `null` enquanto nada foi publicado nesta abertura do diálogo.
+   *
+   * Não é uma cópia de `windows`: o formulário é o rascunho, e o rascunho pode
+   * divergir do banco (janela removida, limite da rota, outra pessoa mexendo).
+   * O resumo existe justamente para mostrar a diferença — se ele lesse o
+   * formulário, repetiria o defeito da #2312 com outra roupa.
+   */
+  const [gravacao, setGravacao] = useState<{
+    rascunho: ScheduleWindow[];
+    timezone: string;
+    janelas: ScheduleWindow[];
+  } | null>(null);
+  // O resumo vale para o rascunho que foi gravado. Mexeu depois (outra faixa,
+  // o botão de copiar, o fuso)? O resumo sai e o "Salvar" volta — senão a
+  // edição sumiria no "Fechar" sem aviso, que é o defeito da #2312 de novo.
+  const publicado =
+    gravacao && gravacao.rascunho === windows && gravacao.timezone === timezone
+      ? gravacao.janelas
+      : null;
+  /** Desligado quando não há o que copiar ou quando a cópia estouraria a rota. */
+  const podeCopiar = podeCopiarParaDiasUteis(windows);
+
+  async function salvar() {
+    try {
+      setGravacao({ rascunho: windows, timezone, janelas: await onSave(windows, timezone) });
+    } catch {
+      // O erro já virou toast no hook (`showApiError`) e o diálogo fica ABERTO:
+      // fechar depois de uma gravação que falhou seria dizer que deu certo.
+    }
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -242,7 +398,7 @@ function ScheduleDialog({
               </p>
             ) : null}
             {windows.map((w, i) => (
-              <div key={i} className="flex items-center gap-2">
+              <div key={i} data-testid="janela" data-dow={w.dow} className="flex items-center gap-2">
                 <Select
                   value={String(w.dow)}
                   onValueChange={(v) =>
@@ -264,6 +420,7 @@ function ScheduleDialog({
                 </Select>
                 <Input
                   type="time"
+                  className="min-w-0 max-md:px-2"
                   value={w.start}
                   aria-label={t("Início")}
                   onChange={(e) =>
@@ -275,6 +432,7 @@ function ScheduleDialog({
                 <span className="text-muted-foreground">–</span>
                 <Input
                   type="time"
+                  className="min-w-0 max-md:px-2"
                   value={w.end}
                   aria-label="Fim"
                   onChange={(e) =>
@@ -302,16 +460,71 @@ function ScheduleDialog({
             >
               <Plus size={16} className="mr-1" /> Adicionar janela
             </Button>
+            {/*
+              O DEFEITO DA #2312 EM UMA LINHA: preenchia-se a segunda e o
+              editor deixava a pessoa acreditar que tinha publicado a semana.
+              O botão copia as faixas do dia-modelo para os outros dias úteis,
+              no RASCUNHO — ainda dá para ajustar ou cancelar antes de salvar.
+              Sem janela nenhuma não há o que copiar, e passar do limite da rota
+              (50) viraria erro no salvamento, então os dois casos desligam o
+              botão em vez de prometer o que não vão entregar.
+            */}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!podeCopiar}
+              title={
+                podeCopiar || windows.length === 0
+                  ? undefined
+                  : t("Limite de 50 janelas por atendente: remova algumas antes de copiar.")
+              }
+              onClick={() => setWindows((ws) => copiarParaDiasUteis(ws))}
+            >
+              <Copy size={16} className="mr-1" />{" "}
+              {t("Copiar estes horários para os outros dias úteis")}
+            </Button>
           </div>
         </div>
 
+        {/*
+          O RESUMO LÊ O RETORNO DA GRAVAÇÃO (`publicado`), nunca o formulário
+          acima. É a outra metade do mesmo defeito: a tela dizia uma semana e o
+          banco guardava um dia. Aqui a pessoa vê o que o banco guardou — e o
+          rodapé vira "Fechar" justamente para ela conferir ANTES de sair, não
+          depois, no toast que ninguém lê.
+        */}
+        {/* A região de status fica SEMPRE montada e o resumo entra dentro dela:
+            leitor de tela anuncia mudança numa região que já existia, não uma
+            região que nasce já cheia. */}
+        <div role="status">
+          {publicado ? (
+            <div data-testid="resumo-publicado" className="space-y-1 rounded-md border p-3">
+              <p className="text-sm font-medium">{t("Publicado")}</p>
+              <ul className="text-sm text-muted-foreground">
+                {resumoDaJornada(publicado, t).map((linha) => (
+                  <li key={linha}>{linha}</li>
+                ))}
+              </ul>
+              <p className="text-xs text-muted-foreground">
+                {t("É isto que ficou gravado — confira os dias e os horários antes de sair.")}
+              </p>
+            </div>
+          ) : null}
+        </div>
+
         <DialogFooter>
-          <Button variant="ghost" onClick={() => onOpenChange(false)}>
-            Cancelar
-          </Button>
-          <Button disabled={isPending} onClick={() => onSave(windows, timezone)}>
-            Salvar
-          </Button>
+          {publicado ? (
+            <Button onClick={() => onOpenChange(false)}>{t("Fechar")}</Button>
+          ) : (
+            <>
+              <Button variant="ghost" onClick={() => onOpenChange(false)}>
+                Cancelar
+              </Button>
+              <Button disabled={isPending} onClick={salvar}>
+                Salvar
+              </Button>
+            </>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -383,10 +596,6 @@ function RoutingCard({ canManage }: { canManage: boolean }) {
                     {MODE_LABELS[m]}
                   </SelectItem>
                 ))}
-                {/* 'load' (balanceamento por carga) é pós-MVP: a API rejeita — desabilitado. */}
-                <SelectItem value="load" disabled>
-                  Balanceamento por carga (em breve)
-                </SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -434,25 +643,42 @@ function RoutingCard({ canManage }: { canManage: boolean }) {
 interface Props {
   canManage: boolean;
   organizationTimezone?: string;
+  /** Módulo opcional `setores` (doc 213). Desligado: sem coluna, sem filtro, sem leitura. */
+  setoresLigado: boolean;
 }
 
-export function AttendantsClient({ canManage, organizationTimezone }: Props) {
+/** No celular o cabeçalho some: o rótulo da coluna vem do `data-rotulo` da célula. */
+const ROTULO_NO_CELULAR =
+  "max-md:before:mr-1.5 max-md:before:text-xs max-md:before:text-muted-foreground max-md:before:content-[attr(data-rotulo)]";
+
+export function AttendantsClient({ canManage, organizationTimezone, setoresLigado }: Props) {
   const t = useT();
   const avail = useAttendants();
   const patch = useUpdateAvailability();
   const [scheduleFor, setScheduleFor] = useState<Attendant | null>(null);
+  const [filtroSetor, setFiltroSetor] = useState<string>(TODOS_OS_SETORES);
+  const sectorsQuery = useSectors(setoresLigado);
+  const sectors = useMemo(() => sectorsQuery.data?.data ?? [], [sectorsQuery.data]);
   const now = useMemo(() => new Date(), []);
 
   const attendants: Attendant[] = useMemo(
     () =>
       (avail.data?.data ?? []).map((a) => ({
         userId: a.user_id,
-        name: a.name ?? a.email ?? a.user_id.slice(0, 8),
+        name: rotuloDoMembro({ full_name: a.name, email: a.email, user_id: a.user_id }, t),
         email: a.email,
         availability: a,
+        sectorIds: a.sector_ids ?? [],
       })),
     [avail.data],
   );
+
+  const visiveis = attendants.filter((a) => {
+    if (filtroSetor === TODOS_OS_SETORES) return true;
+    const temSetorConhecido = a.sectorIds.some((id) => sectors.some((s) => s.id === id));
+    if (filtroSetor === SEM_SETOR) return !temSetorConhecido;
+    return a.sectorIds.includes(filtroSetor);
+  });
 
   const isLoading = avail.isLoading;
   const isError = avail.isError;
@@ -477,6 +703,27 @@ export function AttendantsClient({ canManage, organizationTimezone }: Props) {
               "Status, carga e capacidade de cada atendente — e a jornada semanal que decide os horários oferecidos na Agenda. Sem ela ninguém consegue marcar.",
             )}
           </p>
+          {sectors.length > 0 ? (
+            <div className="mt-3 flex items-center gap-2">
+              <Label htmlFor="filtro-setor" className="text-xs">
+                {t("Setor")}
+              </Label>
+              <Select value={filtroSetor} onValueChange={setFiltroSetor}>
+                <SelectTrigger id="filtro-setor" className="h-8 w-[200px]" aria-label={t("Filtrar por setor")}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={TODOS_OS_SETORES}>{t("Todos os setores")}</SelectItem>
+                  <SelectItem value={SEM_SETOR}>{t("Sem setor")}</SelectItem>
+                  {sectors.map((s) => (
+                    <SelectItem key={s.id} value={s.id}>
+                      {s.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          ) : null}
         </div>
 
         {isLoading ? (
@@ -492,10 +739,11 @@ export function AttendantsClient({ canManage, organizationTimezone }: Props) {
             {t("Nenhum atendente na organização. Convide membros com papel de atendente ou superior.")}
           </p>
         ) : (
-          <Table>
-            <TableHeader>
+          <Table className="max-md:block">
+            <TableHeader className="max-md:hidden">
               <TableRow>
                 <TableHead>{t("Atendente")}</TableHead>
+                {setoresLigado ? <TableHead>{t("Setor")}</TableHead> : null}
                 <TableHead>Status</TableHead>
                 <TableHead>{t("Carga")}</TableHead>
                 <TableHead>{t("Capacidade")}</TableHead>
@@ -503,31 +751,52 @@ export function AttendantsClient({ canManage, organizationTimezone }: Props) {
                 {canManage ? <TableHead className="w-[120px]">{t("Disponível")}</TableHead> : null}
               </TableRow>
             </TableHeader>
-            <TableBody>
-              {attendants.map((a) => {
+            <TableBody className="max-md:block">
+              {visiveis.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={(canManage ? 6 : 5) + (setoresLigado ? 1 : 0)} className="text-sm text-muted-foreground">
+                    {t("Nenhum atendente neste setor.")}
+                  </TableCell>
+                </TableRow>
+              ) : null}
+              {visiveis.map((a) => {
                 const capacity = a.availability?.capacity ?? 5;
                 const load = a.availability?.current_load ?? 0;
                 const windows = a.availability?.schedule?.windows ?? [];
                 return (
-                  <TableRow key={a.userId}>
-                    <TableCell>
+                  <TableRow
+                    key={a.userId}
+                    className="max-md:flex max-md:flex-wrap max-md:items-center max-md:gap-x-3 max-md:gap-y-1 max-md:px-4 max-md:py-2"
+                  >
+                    <TableCell className="max-md:basis-full max-md:p-0 max-md:wrap-anywhere">
                       <div className="font-medium">{a.name}</div>
                       {a.email ? (
                         <div className="text-xs text-muted-foreground">{a.email}</div>
                       ) : null}
                     </TableCell>
-                    <TableCell>
+                    {setoresLigado ? (
+                      <TableCell
+                        data-rotulo={t("Setor")}
+                        className={`max-md:flex max-md:items-center max-md:p-0 ${ROTULO_NO_CELULAR}`}
+                      >
+                        <SectorCell attendant={a} sectors={sectors} canManage={canManage} />
+                      </TableCell>
+                    ) : null}
+                    <TableCell className="max-md:p-0">
                       <div className="flex flex-col items-start gap-1.5">
                         <StatusBadge attendant={a} now={now} />
                         <PresenceBadge attendant={a} />
                       </div>
                     </TableCell>
-                    <TableCell>
+                    <TableCell data-rotulo={t("Carga")} className={`max-md:p-0 ${ROTULO_NO_CELULAR}`}>
                       <span className={load >= capacity ? "font-medium text-destructive" : ""}>
                         {load}
                       </span>
                     </TableCell>
-                    <TableCell>
+                    <TableCell
+                      data-rotulo={t("Capacidade")}
+                      className={`max-md:flex max-md:items-center max-md:p-0 ${ROTULO_NO_CELULAR}`}
+                    >
                       {canManage ? (
                         <Input
                           type="number"
@@ -547,24 +816,38 @@ export function AttendantsClient({ canManage, organizationTimezone }: Props) {
                         capacity
                       )}
                     </TableCell>
-                    <TableCell className="text-sm text-muted-foreground">
+                    <TableCell
+                      data-rotulo={t("Horário")}
+                      className={`text-sm text-muted-foreground max-md:flex max-md:basis-full max-md:items-center max-md:p-0 ${ROTULO_NO_CELULAR}`}
+                    >
                       <div className="flex items-center gap-2">
-                        <span>{summarizeSchedule(windows, t)}</span>
+                        <span>
+                          {summarizeSchedule(windows, t)}
+                          {fusoNoResumo(windows, a.availability?.schedule?.timezone, organizationTimezone)}
+                        </span>
                         {canManage ? (
                           <Button
                             variant="ghost"
                             size="icon"
-                            className="h-7 w-7"
+                            className="md:h-7 md:w-7"
                             aria-label={`Editar horário de ${a.name}`}
                             onClick={() => setScheduleFor(a)}
                           >
+                            {/* Rótulo visível (item opcional da #2312): achar o
+                                editor era o primeiro problema — ele era só um
+                                ícone solto na coluna. O `aria-label` fica, é ele
+                                que a automação e o leitor de tela usam. */}
                             <Clock size={16} />
+                            <span className="ml-1 hidden lg:inline">{t("Editar")}</span>
                           </Button>
                         ) : null}
                       </div>
                     </TableCell>
                     {canManage ? (
-                      <TableCell>
+                      <TableCell
+                        data-rotulo={t("Disponível")}
+                        className={`max-md:ml-auto max-md:flex max-md:items-center max-md:p-0 ${ROTULO_NO_CELULAR}`}
+                      >
                         <Switch
                           checked={!!a.availability?.is_available}
                           aria-label={`Disponibilidade de ${a.name}`}
@@ -589,12 +872,16 @@ export function AttendantsClient({ canManage, organizationTimezone }: Props) {
           onOpenChange={(o) => !o && setScheduleFor(null)}
           isPending={patch.isPending}
           organizationTimezone={organizationTimezone}
-          onSave={(windows, timezone) =>
-            patch.mutate(
-              { userId: scheduleFor.userId, patch: { schedule: { timezone, windows } } },
-              { onSuccess: () => setScheduleFor(null) },
-            )
-          }
+          onSave={async (windows, timezone) => {
+            // `mutateAsync`, e não `mutate`: o resumo lê o RETORNO da gravação
+            // (issue #2312) — fechar o diálogo no `onSuccess` era exatamente o
+            // que impedia a pessoa de conferir o que ficou publicado.
+            const resposta = await patch.mutateAsync({
+              userId: scheduleFor.userId,
+              patch: { schedule: { timezone, windows } },
+            });
+            return resposta?.data?.schedule?.windows ?? [];
+          }}
         />
       ) : null}
     </div>

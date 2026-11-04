@@ -1,5 +1,5 @@
 /**
- * "Novo Lead" pelo funil nasce sem contato (#852, fatia S2).
+ * "Novo negócio" pelo funil nasce sem contato (#852, fatia S2).
  *
  * Medido em `main@174cd0da`: `NewLeadDialog` pede título, descrição, etapa,
  * valor, fechamento e tags — e nada mais. O `contact_id` só vai quando o
@@ -22,8 +22,8 @@
  *
  * O contato fica OPCIONAL, com aviso. O defeito relatado é a ausência do campo,
  * não a permissão de criar sem ele: com o campo na tela e o título nascendo com
- * o nome da pessoa, o caminho fácil já é o certo. Obrigar custaria um major
- * (`exige_acao` em `lib/release/fragmento.ts:44`) e quebraria o hábito de abrir
+ * o nome da pessoa, o caminho fácil já é o certo. Obrigar exigiria ação do
+ * operador (`exige_acao`, então major; minor desde 07/10) e quebraria o hábito de abrir
  * o card no meio da ligação — decisão do dono da instalação em 16/09, depois de
  * medir os dois custos. Se o quadro continuar juntando card órfão, a trava se
  * decide com dado.
@@ -79,7 +79,7 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
-describe("Novo Lead pelo funil — o lead nasce com contato", () => {
+describe("Novo negócio pelo funil — o lead nasce com contato", () => {
   it("escolher um contato da base manda o contact_id na criação", async () => {
     const user = userEvent.setup();
     render(
@@ -95,7 +95,7 @@ describe("Novo Lead pelo funil — o lead nasce com contato", () => {
     await user.click(await screen.findByRole("button", { name: /Michelle/ }));
 
     await user.type(screen.getByLabelText("Título"), "Consulta trabalhista");
-    await user.click(screen.getByRole("button", { name: "Criar lead" }));
+    await user.click(screen.getByRole("button", { name: "Criar negócio" }));
 
     await waitFor(() => expect(criarLead).toHaveBeenCalledTimes(1));
     expect(criarLead.mock.calls[0]?.[0]).toMatchObject({ contact_id: MICHELLE.id });
@@ -137,7 +137,7 @@ describe("Novo Lead pelo funil — o lead nasce com contato", () => {
     );
 
     await user.type(await screen.findByLabelText("Título"), "Outro assunto");
-    await user.click(screen.getByRole("button", { name: "Criar lead" }));
+    await user.click(screen.getByRole("button", { name: "Criar negócio" }));
 
     await waitFor(() => expect(criarLead).toHaveBeenCalledTimes(1));
     expect(criarLead.mock.calls[0]?.[0]).not.toHaveProperty("contact_id");
@@ -157,7 +157,7 @@ describe("Novo Lead pelo funil — o lead nasce com contato", () => {
     expect(await screen.findByText(/não recebe WhatsApp/i)).toBeTruthy();
 
     await user.type(screen.getByLabelText("Título"), "Consulta trabalhista");
-    await user.click(screen.getByRole("button", { name: "Criar lead" }));
+    await user.click(screen.getByRole("button", { name: "Criar negócio" }));
 
     await waitFor(() => expect(criarLead).toHaveBeenCalledTimes(1));
     expect(criarLead.mock.calls[0]?.[0]).not.toHaveProperty("contact_id");

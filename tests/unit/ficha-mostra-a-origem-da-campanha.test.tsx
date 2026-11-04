@@ -55,6 +55,7 @@ const BASE = {
   cpf_hash: null,
   birthdate: null,
   is_blocked: false,
+  is_personal: false,
   blocked_reason: null,
   is_anonymized: false,
   anonymized_at: null,
@@ -69,6 +70,7 @@ const BASE = {
   updated_at: "2026-01-01T10:00:00.000Z",
   last_activity_at: null,
   first_service_at: null,
+  ai_opt_out: false,
 } satisfies Contact;
 
 let contato: Contact = BASE;
@@ -134,5 +136,27 @@ describe("a ficha do contato mostra a origem da campanha", () => {
       expect(valorDe(nivel), nivel).toBeNull();
     }
     expect(screen.queryByText(FRASE)).toBeNull();
+  });
+
+  const AVISO = "Provável: deduzida pelo horário do clique. A mensagem chegou sem o código do link.";
+
+  it("origem deduzida pelo horário do clique: a ficha avisa que é dedução", () => {
+    abrirFicha(
+      {
+        ad_platform: "site",
+        utm_source: "site",
+        utm_campaign: "Landing · Verão",
+        origem_inferida_por: "horario",
+      },
+      "site",
+    );
+    expect(screen.getByText(AVISO)).toBeInTheDocument();
+    expect(valorDe("Campanha")).toBe("Landing · Verão");
+  });
+
+  it("a mesma origem vinda do código não ganha o aviso", () => {
+    abrirFicha({ ad_platform: "site", utm_source: "site", utm_campaign: "Landing · Verão" }, "site");
+    expect(valorDe("Campanha")).toBe("Landing · Verão");
+    expect(screen.queryByText(AVISO)).toBeNull();
   });
 });

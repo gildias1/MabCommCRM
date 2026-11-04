@@ -19,6 +19,26 @@ export interface McpContext {
   idempotencyKey?: string;
   /** Job estável do runtime in-process; nunca vem dos argumentos da tool. */
   sourceJobId?: string;
+  /**
+   * O CONTATO que este turno atende — contexto de CONFIANÇA do handler.
+   *
+   * Mesmo status de `sourceJobId`: nasce do lado de quem monta o turno e NUNCA
+   * vem dos argumentos da tool — o modelo não escreve este campo nem tem como
+   * alcançá-lo. `lib/ai/runtime/tools.ts` o injeta na chamada do handler, que é
+   * o único ponto que tem `input.contatoDoTurno`, para valer para todo chamador
+   * de `pickToolsFromMcp`.
+   *
+   * Ausente nos ingressos de fora do turno (rota HTTP, MCP externo) — e a
+   * ausência é o que mantém o comportamento deles intacto. O Operador NÃO está
+   * entre eles: `operator-turn.ts` monta o turno com `contactId: job.contact_id`,
+   * então ele também recebe o contato da conversa e também fica escopado. Uso hoje: o
+   * escopo de LEITURA de contato de `lib/mcp/tools/contacts.ts` (#2158) e das
+   * demais leituras do atendimento — `conversations.ts` (lista, conversa,
+   * histórico) e `comercio.ts` (pedidos) (#2178). A conversa é com alguém, e a
+   * ficha, a busca, a conversa, o histórico e os pedidos de outro cliente não
+   * saem do turno.
+   */
+  contatoDoTurno?: string;
   organizationId: string;
   role: Role;
   actor: Actor;
@@ -43,6 +63,12 @@ export interface McpToolDefinition<TInput extends z.ZodRawShape = z.ZodRawShape>
    */
   requiresScope: "mcp:read" | "mcp:write";
   /**
+   * Atende token de empresa SUSPENSA (`McpAuthResult.orgSuspensa`). Só a
+   * privacidade (LGPD nunca é bloqueada — decisão do dono, 30/09); a cerca
+   * `tests/unit/org-suspensa-so-nas-rotas-permitidas.test.ts` vigia onde aparece.
+   */
+  permiteOrgSuspensa?: true;
+  /**
    * Limpa os args ANTES da auditoria (os dois ingressos: runtime e `/api/mcp`).
    *
    * Existe porque `auditMcpToolCall` grava os args em `api_audit_log.metadata` e
@@ -52,6 +78,19 @@ export interface McpToolDefinition<TInput extends z.ZodRawShape = z.ZodRawShape>
    * é o dado do cliente, e log é lugar de metadado, não de conteúdo.
    */
   redigirParaAuditoria?: (args: Record<string, unknown>) => Record<string, unknown>;
+  /**
+   * ESCRITA DELEGADA AO CONTATO (servidores MCP por agente, migration 9095).
+   *
+   * Só uma remota de servidor `oauth_por_contato`, com `escrita_delegada`
+   * ligada no cadastro, marcada `escrita` pelo admin em `tool_ids` E montada com
+   * o token do CONTATO DO TURNO recebe isto (`definirFerramentasDoServidorDoAgente`).
+   * A ponte (`lib/ai/runtime/tools.ts`) então não aplica a recusa
+   * `escrita_sem_escopo_do_turno`: a escrita acontece na conta do terceiro com a
+   * credencial que o próprio contato autorizou, e não alcança registro nenhum do
+   * CRM. Auditoria, papel e escopo continuam valendo. Nenhuma tool compilada
+   * declara isto.
+   */
+  escritaDelegadaAoContato?: true;
   /**
    * O que a tool DECLARA quando a resposta é um vazio que NÃO é sucesso.
    *
@@ -72,6 +111,22 @@ export interface McpToolDefinition<TInput extends z.ZodRawShape = z.ZodRawShape>
    * transformaria comportamento normal em alarme.
    */
   motivoDoVazio?: (resultado: unknown) => string | null;
+  /**
+   * O que a tool DECLARA como o "termo" desta chamada — o que a pessoa escreveu
+   * na busca, para o painel poder contar "não achei" POR TERMO e não só
+   * "falhou".
+   *
+   * Sem isto o termo só existe dentro de `metadata.args`, cujo nome do campo é
+   * de cada tool (`args.termo` numa, `args.query` ou um filtro redigido noutra):
+   * a contagem no banco teria de gravar o nome do argumento de UMA tool dentro
+   * do SQL. Declarar aqui deixa a auditoria subir o termo para um campo próprio
+   * — `metadata.termo` — que a leitura por termo lê sem conhecer tool nenhuma.
+   *
+   * Devolver `null` (ou não declarar) = a chamada não tem termo a contar. O
+   * termo é do cliente e o audit já grava os args; isto não abre dado novo, só
+   * dá ao leitor uma chave estável.
+   */
+  termoBuscado?: (input: z.infer<z.ZodObject<TInput>>) => string | null;
   handler: (
     input: z.infer<z.ZodObject<TInput>>,
     ctx: McpContext,

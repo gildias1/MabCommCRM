@@ -18,6 +18,7 @@ import {
   contaSchema,
   ehEntidadeDoCatalogo,
   formaDePagamentoSchema,
+  lerAlteracao,
   planoDeContaSchema,
   SCHEMA_POR_ENTIDADE,
   COLUNAS_POR_ENTIDADE,
@@ -25,9 +26,18 @@ import {
 } from "./catalogo";
 
 describe("conta", () => {
-  it("nasce em caixa e BRL quando não se diz nada", () => {
+  it("nasce em caixa e sem saldo quando não se diz nada — e SEM moeda", () => {
     const r = contaSchema.parse({ name: "Caixa" });
-    expect(r).toMatchObject({ kind: "cash", currency: "BRL", opening_balance_cents: 0 });
+    expect(r).toMatchObject({ kind: "cash", opening_balance_cents: 0 });
+    // A moeda saiu do schema no #3379: quem a resolve é o SERVIDOR
+    // (`moedaDaOrganizacao`), a partir de `organizations.currency`. Um default
+    // aqui era o defeito — a conta de organização em dólar nascia em real sem
+    // ninguém ter escrito isso.
+    expect(r).not.toHaveProperty("currency");
+  });
+
+  it("descarta a moeda que vier no corpo", () => {
+    expect(contaSchema.parse({ name: "Caixa", currency: "EUR" })).not.toHaveProperty("currency");
   });
 
   it("aceita saldo inicial NEGATIVO — e isso é deliberado", () => {
@@ -97,5 +107,35 @@ describe("o mapa de entidades", () => {
     expect(ehEntidadeDoCatalogo("contas")).toBe(true);
     expect(ehEntidadeDoCatalogo("financial_accounts")).toBe(false);
     expect(ehEntidadeDoCatalogo("../../etc")).toBe(false);
+  });
+});
+
+describe("a edição (PATCH) — lerAlteracao", () => {
+  it("toda entidade lê um corpo parcial sem lançar, e devolve SÓ a chave que veio", () => {
+    // Duas falhas medidas na rota que já existia: `.partial()` sobre a regra de
+    // comissão (que tem `.refine`) LANÇAVA no zod 4 — 500 sempre —, e na conta o
+    // `.partial()` aplicava os defaults às chaves ausentes, então editar o nome
+    // zerava o saldo inicial e voltava a moeda para BRL.
+    for (const chave of Object.keys(ENTIDADES_DO_CATALOGO)) {
+      const k = chave as keyof typeof ENTIDADES_DO_CATALOGO;
+      const r = lerAlteracao(k, { name: "Novo nome" });
+      expect(r, chave).toEqual({ ok: true, campos: { name: "Novo nome" } });
+    }
+  });
+
+  it("regra de comissão: os dois alvos nulos são recusados; um só fica com o CHECK do banco", () => {
+    expect(
+      lerAlteracao("regras_de_comissao", { attendant_user_id: null, event_type_id: null }),
+    ).toEqual({ ok: false, mensagem: "Escolha ao menos uma pessoa ou um serviço." });
+    expect(lerAlteracao("regras_de_comissao", { attendant_user_id: null }).ok).toBe(true);
+    expect(lerAlteracao("regras_de_comissao", { percent: 35 })).toEqual({
+      ok: true,
+      campos: { percent: 35 },
+    });
+  });
+
+  it("a validação da criação vale na edição", () => {
+    expect(lerAlteracao("contas", { name: "C" }).ok).toBe(false);
+    expect(lerAlteracao("planos_de_conta", { direction: "debito" }).ok).toBe(false);
   });
 });

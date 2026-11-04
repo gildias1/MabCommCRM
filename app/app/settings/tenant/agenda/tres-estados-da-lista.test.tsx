@@ -1,3 +1,4 @@
+import { apiClient } from "@/lib/api/client";
 /**
  * ERRO DE LEITURA NÃO É LISTA VAZIA.
  *
@@ -26,7 +27,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { TiposDeAgendamentoClient, type TipoRow } from "./_client";
@@ -75,6 +76,8 @@ function montar(props: Partial<React.ComponentProps<typeof TiposDeAgendamentoCli
       podeLigarClientePelaAgenda={false}
       colegasPodemMexerNaAgendaLigado={false}
       podeMudarAgendaDosColegas={false}
+      meetAbertoLigado={false}
+      podeMudarMeetAberto={false}
       {...props}
     />
     </QueryClientProvider>,
@@ -119,5 +122,91 @@ describe("os três estados da lista de tipos", () => {
     // O defeito original: `const [{ data: tipos }] = await Promise.all(...)`.
     expect(fonte).toMatch(/\[\s*\{[^}]*\berror:\s*erroTipos\b[^}]*\}/);
     expect(fonte).toMatch(/erroDeLeitura=\{\s*erroTipos\b/);
+  });
+});
+
+
+describe("canal dos lembretes pela tela", () => {
+  it("seleção explícita chega ao PATCH e o texto explica a prioridade", async () => {
+    vi.mocked(apiClient.patch).mockResolvedValue({ data: { id: TIPO.id } } as never);
+    montar({ tiposIniciais: [{ ...TIPO, reminder_enabled: true }], canais: [{ id: "clinica", nome: "Clínica · 2218" }, { id: "cursos", nome: "Cursos · 9274" }] });
+    fireEvent.click(screen.getByTestId(`editar-${TIPO.id}`));
+    const seletor = screen.getByTestId(`editar-lembrete-canal-${TIPO.id}`) as HTMLSelectElement;
+    expect(seletor.value).toBe("");
+    fireEvent.change(seletor, { target: { value: "clinica" } });
+    expect(screen.getByText(/vale para todas as reservas deste tipo/)).toBeTruthy();
+    fireEvent.submit(screen.getByTestId(`form-editar-${TIPO.id}`));
+    await waitFor(() => expect(apiClient.patch).toHaveBeenCalledWith("/api/v1/agenda/tipos", expect.objectContaining({ reminder_channel_session_id: "clinica" })));
+  });
+  it("falha de leitura preserva o canal guardado, sem voltar ao automático", () => {
+    montar({ tiposIniciais: [{ ...TIPO, reminder_enabled: true, reminder_channel_session_id: "clinica" }], erroCanais: "falha" });
+    fireEvent.click(screen.getByTestId(`editar-${TIPO.id}`));
+    const seletor = screen.getByTestId(`editar-lembrete-canal-${TIPO.id}`) as HTMLSelectElement;
+    expect(seletor.value).toBe("clinica"); expect(seletor.disabled).toBe(true);
+    const dados = new FormData(screen.getByTestId(`form-editar-${TIPO.id}`) as HTMLFormElement);
+    expect(dados.has("reminder_channel_session_id")).toBe(false);
+    expect(screen.getByText(/A escolha guardada será preservada/)).toBeTruthy();
+  });
+});
+
+/**
+ * O MODELO APROVADO PARA FORA DA JANELA DE 24 H (migration 9092). Mesmo desenho
+ * do canal acima: a escolha chega ao PATCH, "nenhum" volta a `null`, e falha de
+ * leitura trava o seletor sem apagar o que estava guardado.
+ */
+describe("modelo do lembrete fora da janela, pela tela", () => {
+  const MODELOS = [{ id: "modelo-a", nome: "lembrete_da_consulta (pt_BR) · Clínica" }];
+
+  it("a escolha chega ao PATCH, e voltar a nenhum manda null", async () => {
+    vi.mocked(apiClient.patch).mockClear();
+    vi.mocked(apiClient.patch).mockResolvedValue({ data: { id: TIPO.id } } as never);
+    montar({ tiposIniciais: [{ ...TIPO, reminder_enabled: true }], modelos: MODELOS });
+    fireEvent.click(screen.getByTestId(`editar-${TIPO.id}`));
+    const seletor = screen.getByTestId(`editar-lembrete-modelo-${TIPO.id}`) as HTMLSelectElement;
+    expect(seletor.value).toBe("");
+    fireEvent.change(seletor, { target: { value: "modelo-a" } });
+    expect(screen.getByText(/as variáveis recebem, nesta ordem/)).toBeTruthy();
+    fireEvent.submit(screen.getByTestId(`form-editar-${TIPO.id}`));
+    await waitFor(() =>
+      expect(apiClient.patch).toHaveBeenCalledWith(
+        "/api/v1/agenda/tipos",
+        expect.objectContaining({ reminder_meta_template_id: "modelo-a" }),
+      ),
+    );
+  });
+
+  it("modelo guardado que não está mais na lista aparece como indisponível, e não some", () => {
+    montar({ tiposIniciais: [{ ...TIPO, reminder_enabled: true, reminder_meta_template_id: "apagado" }], modelos: MODELOS });
+    fireEvent.click(screen.getByTestId(`editar-${TIPO.id}`));
+    const seletor = screen.getByTestId(`editar-lembrete-modelo-${TIPO.id}`) as HTMLSelectElement;
+    expect(seletor.value).toBe("apagado");
+    expect(screen.getByText("Modelo configurado indisponível — escolha outro")).toBeTruthy();
+  });
+
+  it("falha de leitura preserva o modelo guardado", () => {
+    montar({
+      tiposIniciais: [{ ...TIPO, reminder_enabled: true, reminder_meta_template_id: "modelo-a" }],
+      erroModelos: "falha",
+    });
+    fireEvent.click(screen.getByTestId(`editar-${TIPO.id}`));
+    const seletor = screen.getByTestId(`editar-lembrete-modelo-${TIPO.id}`) as HTMLSelectElement;
+    expect(seletor.value).toBe("modelo-a");
+    expect(seletor.disabled).toBe(true);
+    const dados = new FormData(screen.getByTestId(`form-editar-${TIPO.id}`) as HTMLFormElement);
+    expect(dados.has("reminder_meta_template_id")).toBe(false);
+    expect(screen.getByText(/Não foi possível carregar os modelos aprovados/)).toBeTruthy();
+  });
+
+  it("sem modelo que sirva, o seletor continua na tela e diz onde criar", () => {
+    montar({ tiposIniciais: [{ ...TIPO, reminder_enabled: true }] });
+    fireEvent.click(screen.getByTestId(`editar-${TIPO.id}`));
+    expect(screen.getByTestId(`editar-lembrete-modelo-${TIPO.id}`)).toBeTruthy();
+    expect(screen.getByText(/Crie um em Conexões → Modelos/)).toBeTruthy();
+  });
+
+  it("a página passa a falha de leitura dos modelos, e não só a lista", () => {
+    const fonte = readFileSync(join(__dirname, "page.tsx"), "utf8").replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, "");
+    expect(fonte).toMatch(/\{\s*data:\s*modelos,\s*error:\s*erroModelos\s*\}/);
+    expect(fonte).toMatch(/erroModelos=\{\s*erroModelos\b/);
   });
 });

@@ -7,6 +7,7 @@
 import { z } from "zod";
 import { flowGraphSchema } from "./graph-schema";
 import { MAX_THRESHOLD_MINUTES, MIN_THRESHOLD_MINUTES } from "./gap-de-retorno";
+import { BASES_DA_PAUSA, MAX_PAUSA_DE_REENTRADA_MINUTES } from "./pausa-de-reentrada";
 
 /**
  * Vocabulário da coluna `surface` (0167; `atendimento` na 0394 — roteiro de
@@ -27,8 +28,9 @@ export const createFollowupFlowSchema = z.strictObject({
 // desse fluxo cancela (outcome='replied') na 1ª resposta do contato em vez de
 // acordar o classify. Sibling de `kind` (não dentro de `params`) porque é uma
 // política de REAÇÃO À RESPOSTA, ortogonal a como o fluxo foi disparado — vale
-// pros kinds igualmente. Default false quando ausente (fluxos existentes
-// continuam acordando o classify, comportamento inalterado).
+// pros kinds igualmente. Default false quando ausente, EXCETO em
+// `appointment_no_show`, em que ausente vale true (#3400; ver
+// `parseCancelOnReply` em `lib/followup/reactivity.ts`).
 const CANCEL_ON_REPLY = { cancel_on_reply: z.boolean().optional() };
 
 export const triggerConfigSchema = z.discriminatedUnion("kind", [
@@ -50,6 +52,31 @@ export const triggerConfigSchema = z.discriminatedUnion("kind", [
     params: z.strictObject({
       threshold_minutes: z.number().int().min(5).max(10_080),
       segments: z.array(z.string()).optional(),
+      // Pausa antes de o fluxo recomeçar para quem já encerrou uma inscrição
+      // nele (`lib/followup/pausa-de-reentrada.ts`). Ausente ou 0 = sem pausa.
+      reentry_pause_minutes: z.number().int().min(0).max(MAX_PAUSA_DE_REENTRADA_MINUTES).optional(),
+      // Teto do silêncio: com ele, o fluxo só começa enquanto o silêncio for
+      // RECENTE (entre `threshold_minutes` e este valor). Sem ele, a varredura
+      // pega todo contato calado há mais que o mínimo — horas ou dias — e um
+      // fluxo de "10 minutos depois" disparava de uma vez para todos ao ser ligado.
+      max_silence_minutes: z.number().int().min(5).max(10_080).optional(),
+      // De onde a pausa conta (`pausa-de-reentrada.ts`). Ausente = `ultima_mensagem`.
+      reentry_pause_basis: z.enum(BASES_DA_PAUSA).optional(),
+      // Só alcança quem a EQUIPE já respondeu: na conversa que guarda o inbound
+      // mais recente, tem de haver outbound DEPOIS dele. Ausente ou `false` = o
+      // comportamento de sempre, byte a byte — ver a seção "Dívida da equipe não
+      // é silêncio do cliente" no cabeçalho de `silence-sweep.ts`.
+      exige_resposta_da_equipe: z.boolean().optional(),
+      /**
+       * Quantas vezes NO TOTAL este fluxo pode recomeçar para o mesmo contato.
+       * Ausente = sem teto (o comportamento de sempre).
+       *
+       * A pausa de reentrada só ESPAÇA as repetições; quem nunca responde
+       * continua elegível para sempre, porque nada atualiza a última mensagem
+       * dele. Sem teto, o fluxo recomeça a cada pausa — 24 h, 48 h, 72 h —
+       * indefinidamente.
+       */
+      max_enrollments_por_contato: z.number().int().min(1).max(50).optional(),
     }),
     ...CANCEL_ON_REPLY,
   }),
@@ -116,4 +143,10 @@ export const createFollowupEnrollmentSchema = z.strictObject({
   // ausente, resolve-se do próprio pointer (agentes que o armam). Validado
   // contra a org antes de gravar.
   agent_id: z.string().uuid().optional(),
+  // #3746: a conversa de onde a inscrição nasceu. Opcional porque a fila de
+  // follow-ups inscreve sem ter uma conversa aberta, e porque um cliente antigo
+  // que não manda o campo não pode parar de funcionar. Quando vem, é a conversa
+  // que a régua de posse confere (o Atendente inscreve o cliente que ele
+  // atende); sem ela, vale qualquer conversa do contato atribuída a ele.
+  conversation_id: z.string().uuid().optional(),
 });

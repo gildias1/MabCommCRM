@@ -53,6 +53,7 @@ export function EditorDeSkill({ nome, aberto, aoMudarAberto }: Props) {
 
   const [descricao, setDescricao] = useState("");
   const [keywords, setKeywords] = useState("");
+  const [etiquetas, setEtiquetas] = useState("");
   const [corpo, setCorpo] = useState("");
   const [probe, setProbe] = useState<string[] | undefined>(undefined);
 
@@ -61,6 +62,7 @@ export function EditorDeSkill({ nome, aberto, aoMudarAberto }: Props) {
     if (!aberto || !s) return;
     setDescricao(s.description);
     setKeywords(s.matcher.any_keywords.join(", "));
+    setEtiquetas((s.matcher.any_tags ?? []).join(", "));
     setCorpo(s.body);
     setProbe(s.matcher.probe_keywords);
   }, [aberto, skill.data]);
@@ -68,6 +70,7 @@ export function EditorDeSkill({ nome, aberto, aoMudarAberto }: Props) {
   const linhas = contarLinhas(corpo);
   const excedeTeto = linhas > MAX_LINHAS;
   const veioDePacote = skill.data?.tem_arquivos_do_pacote === true;
+  const arquivosDoPacote = skill.data?.arquivos_do_pacote ?? [];
 
   function salvarSkill() {
     const anyKeywords = parseKeywords(keywords);
@@ -75,6 +78,7 @@ export function EditorDeSkill({ nome, aberto, aoMudarAberto }: Props) {
       toast.error(t("Informe pelo menos uma palavra-chave de ativação."));
       return;
     }
+    const anyTags = parseKeywords(etiquetas);
     if (descricao.trim() === "") {
       toast.error(t("A descrição é obrigatória."));
       return;
@@ -93,7 +97,11 @@ export function EditorDeSkill({ nome, aberto, aoMudarAberto }: Props) {
         body: {
           description: descricao.trim(),
           body: corpo,
-          matcher: { any_keywords: anyKeywords, ...(probe ? { probe_keywords: probe } : {}) },
+          matcher: {
+            any_keywords: anyKeywords,
+            ...(probe ? { probe_keywords: probe } : {}),
+            ...(anyTags.length > 0 ? { any_tags: anyTags } : {}),
+          },
         },
       },
       {
@@ -113,7 +121,7 @@ export function EditorDeSkill({ nome, aberto, aoMudarAberto }: Props) {
           <DialogTitle>{t("Editar skill")} “{nome}”</DialogTitle>
           <DialogDescription>
             {t(
-              "Salvar cria uma versão nova (a antiga fica no histórico). O corpo só entra na conversa quando uma das palavras-chave aparece na mensagem do cliente.",
+              "Salvar cria uma versão nova (a antiga fica no histórico). O corpo só entra na conversa quando uma das palavras-chave aparece na mensagem do cliente, ou quando a conversa ou o contato tem uma das etiquetas de ativação.",
             )}
           </DialogDescription>
         </DialogHeader>
@@ -126,11 +134,30 @@ export function EditorDeSkill({ nome, aberto, aoMudarAberto }: Props) {
         {skill.isSuccess && (
           <div className="flex flex-col gap-4 py-2">
             {veioDePacote && (
-              <p className="rounded-md border border-border/60 p-3 text-sm text-muted-foreground">
-                {t(
-                  "Esta skill veio de um pacote com arquivos. Para mudar o texto, edite o pacote e envie o .zip de novo.",
-                )}
-              </p>
+              <div className="flex flex-col gap-2 rounded-md border border-border/60 p-3 text-sm">
+                <p className="text-muted-foreground">
+                  {t(
+                    "Skill de pacote: descrição, palavras-chave e corpo são editáveis. Ao salvar, a versão nova herda os arquivos do pacote — nada se perde.",
+                  )}
+                </p>
+                <div className="flex flex-col gap-1">
+                  <span className="text-xs font-medium">
+                    {t("Arquivos do pacote (somente leitura)")}
+                  </span>
+                  <ul className="flex flex-col gap-0.5">
+                    {arquivosDoPacote.map((caminho) => (
+                      <li key={caminho} className="font-mono text-xs text-muted-foreground">
+                        {caminho}
+                      </li>
+                    ))}
+                  </ul>
+                  <span className="text-xs text-muted-foreground">
+                    {t(
+                      "Para adicionar, trocar ou remover um arquivo, monte o pacote de novo e envie o .zip — esta tela só grava texto.",
+                    )}
+                  </span>
+                </div>
+              </div>
             )}
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="skill-desc">{t("Descrição (aparece no índice do agente)")}</Label>
@@ -152,6 +179,21 @@ export function EditorDeSkill({ nome, aberto, aoMudarAberto }: Props) {
               />
               <p className="text-xs text-muted-foreground">
                 {t("A skill é carregada quando o cliente escreve uma destas palavras.")}
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="skill-tags">{t("Etiquetas que ativam (opcional)")}</Label>
+              <Input
+                id="skill-tags"
+                value={etiquetas}
+                onChange={(e) => setEtiquetas(e.target.value)}
+                placeholder={t("odonto, clínica")}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  "Se a conversa ou o contato tiver uma destas etiquetas, a skill entra mesmo sem a palavra-chave.",
+                )}
               </p>
             </div>
 
@@ -222,7 +264,11 @@ export function EditorDeSkill({ nome, aberto, aoMudarAberto }: Props) {
           </Button>
           <Button
             onClick={salvarSkill}
-            disabled={salvar.isPending || skill.isLoading || excedeTeto || veioDePacote}
+            // `veioDePacote` NÃO entra aqui: o texto de skill de pacote é
+            // editável e o PUT herda os arquivos na versão nova (#2047). O que
+            // continua bloqueado é a estrutura (arquivo), e a tela explica isso
+            // no aviso acima — o único veto do botão é o teto de linhas.
+            disabled={salvar.isPending || skill.isLoading || excedeTeto}
           >
             {salvar.isPending ? t("Salvando…") : t("Salvar")}
           </Button>

@@ -47,6 +47,15 @@ vi.mock("@/components/shell/TopBar", () => ({ TopBar: () => null }));
 vi.mock("@/components/shell/BarraDeProgressoNavegacao", () => ({
   BarraDeProgressoNavegacao: () => null,
 }));
+// A barra de abas do celular é a SEGUNDA peça fixa do rodapé, e ela fica fora
+// aqui pelo mesmo critério das três acima: não é o assunto. Ela lê `useAuth`
+// para herdar o portão do sidebar, e montá-la exigiria um `<AuthProvider>` em
+// volta de um teste que mede geometria de rodapé.
+//
+// Isto NÃO a deixa sem cobertura — ela declara a própria ocupação e o gate
+// `tests/unit/rodape-ocupado-contrato.test.ts` cobra isso dela por arquivo, mais
+// `components/shell/BarraInferior.celular.test.tsx`, que prova a regra da tela.
+vi.mock("@/components/shell/BarraInferior", () => ({ BarraInferior: () => null }));
 vi.mock("@/hooks/atendimento/useSinalDePresenca", () => ({ useSinalDePresenca: () => {} }));
 vi.mock("@/hooks/notifications/useInboundMessageAlerts", () => ({
   useInboundMessageAlerts: () => {},
@@ -194,8 +203,15 @@ describe("com a chamada em andamento", () => {
 
     expect(reserva()).toBeGreaterThanOrEqual(ocupacao);
     expect(variavel()).toBe(`${reserva()}px`);
+    // A ÁREA SEGURA É O TERCEIRO TERMO. O indicador de home do iOS em tela
+    // cheia ocupa ~34px do fundo e não é peça nossa — ninguém o declara. Fora
+    // do `max()` ele abria um buraco estreito: peça de 20px de alcance deixa a
+    // reserva no piso de 24px, 24 < 34, e o estilo inline vence a classe
+    // `pb-area-segura` do `<main>` — o conteúdo voltava para debaixo do
+    // indicador por causa da peça que devia protegê-lo. O porquê inteiro está
+    // no cabeçalho de `estiloDaReserva`.
     expect(rodape.getAttribute("style") ?? "").toContain(
-      `max(${PISO_DO_RODAPE}px, var(${VARIAVEL_DA_OCUPACAO}, 0px))`,
+      `max(${PISO_DO_RODAPE}px, env(safe-area-inset-bottom, 0px), var(${VARIAVEL_DA_OCUPACAO}, 0px))`,
     );
   });
 
@@ -244,6 +260,73 @@ describe("com a chamada em andamento", () => {
     expect(reserva()).toBeGreaterThan(0);
     redesenhar({ comChamada: false, comAtalho: false });
     expect(reserva()).toBe(0);
+  });
+});
+
+/**
+ * A TRANSIÇÃO DE MEDIDA — o defeito da #3061, na fronteira entre o navegador e o
+ * jsdom.
+ *
+ * Zero é ambíguo: é "não houve medição" num ambiente sem layout, e é "a peça
+ * saiu de vista" quando o CSS a esconde. O hook passou a desempatar pelos sinais
+ * do navegador (`getClientRects()` vazio + `display` computado — ver
+ * `saiuDeVista` em `lib/ui/rodape-ocupado.tsx`).
+ *
+ * O jsdom dá UM desses sinais e não o outro: `getClientRects()` é vazio aqui
+ * porque não há layout, e o `display` computado responde o que o estilo manda.
+ * É por isso que o caso "com o CSS escondendo" pode ser provado aqui, e o caso
+ * do meio (peça em vista medindo zero) não: ele só existe no navegador, e quem o
+ * julga é `tests/e2e/celular-cabe-na-tela.spec.ts` — o caso que estreita e
+ * alarga a MESMA página.
+ */
+describe("quando a medida cai para zero", () => {
+  it("com a peça escondida pelo CSS, o zero É medida: a reserva volta ao piso (#3061)", () => {
+    const { reserva, painel } = montar();
+    const elemento = painel()!;
+    const medicao = vi.spyOn(elemento, "getBoundingClientRect");
+
+    // O painel cresceu (o aviso de mídia apareceu): a reserva acompanha.
+    medicao.mockReturnValue({ height: 76 } as DOMRect);
+    act(() => {
+      for (const observador of ObservadorDeTeste.instancias) observador.disparar();
+    });
+    expect(reserva()).toBe(PAINEL_DE_CHAMADA.distancia + 76);
+
+    // Agora o CSS esconde a peça — é o que `md:hidden` faz com a barra de abas.
+    // O navegador entrega altura 0, nenhum retângulo de cliente e `display: none`:
+    // a peça saiu de vista, e a reserva tem de cair para o piso declarado.
+    elemento.style.display = "none";
+    medicao.mockReturnValue({ height: 0 } as DOMRect);
+    act(() => {
+      for (const observador of ObservadorDeTeste.instancias) observador.disparar();
+    });
+
+    expect(reserva()).toBe(ocupacaoDaPeca(PAINEL_DE_CHAMADA));
+    // E o piso continua sendo o chão: a peça com altura declarada não desaparece
+    // do rodapé só porque o CSS a escondeu.
+    expect(reserva()).toBeGreaterThan(0);
+  });
+
+  it("sem o CSS esconder, o zero segue sendo 'não houve medição' e a última medida fica", () => {
+    const { reserva, painel } = montar();
+    const elemento = painel()!;
+    const medicao = vi.spyOn(elemento, "getBoundingClientRect");
+
+    medicao.mockReturnValue({ height: 76 } as DOMRect);
+    act(() => {
+      for (const observador of ObservadorDeTeste.instancias) observador.disparar();
+    });
+    expect(reserva()).toBe(PAINEL_DE_CHAMADA.distancia + 76);
+
+    // Zero SEM `display: none`: no jsdom esta é a única leitura possível (não há
+    // layout para dar o retângulo de cliente que separaria os dois casos), então
+    // a guarda de "não houve medição" tem de continuar valendo aqui — é ela que
+    // mantém de pé todos os testes de unidade que dependem do piso declarado.
+    medicao.mockReturnValue({ height: 0 } as DOMRect);
+    act(() => {
+      for (const observador of ObservadorDeTeste.instancias) observador.disparar();
+    });
+    expect(reserva()).toBe(PAINEL_DE_CHAMADA.distancia + 76);
   });
 });
 

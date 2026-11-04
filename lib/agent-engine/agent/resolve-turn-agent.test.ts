@@ -27,6 +27,7 @@ function fakeConfig(agentId: string): PublishedAgentConfig {
     splitMessages: false,
     splitMaxChars: 900,
     inboundDebounceMs: null,
+    replyMinIntervalMs: null,
     multimodalInput: false,
     casesEnabled: false,
     toolIds: [],
@@ -40,6 +41,8 @@ function fakeConfig(agentId: string): PublishedAgentConfig {
   operatorModel: null,
   operatorToolIds: [], pipelineIds: [],
   agentCreatedBy: null,
+  vozEnabled: false,
+  vozQuando: 'espelhar',
   };
 }
 
@@ -80,8 +83,8 @@ const baseInput = {
  * uma promessa que o teste controla. Por padrão, desligado — o roteamento de
  * sempre, que é o que os casos 1 a 16 medem.
  */
-function jevFalso(estado: EstadoDaTarefa = 'desligada', escolha: Promise<EscolhaDoJev | null> = Promise.resolve(null)) {
-  const jev = { estado: Promise.resolve(estado), escolha, observar: vi.fn<JevNoRoteador['observar']>() };
+function jevFalso(estado: EstadoDaTarefa = 'desligada', escolha: Promise<EscolhaDoJev | null> = Promise.resolve(null), modo: 'comparacao' | 'sob_demanda' = 'comparacao') {
+  const jev = { estado: Promise.resolve(estado), escolha, modo: Promise.resolve(modo), observar: vi.fn<JevNoRoteador['observar']>() };
   return { jev, consultarJev: vi.fn((): JevNoRoteador => jev) };
 }
 
@@ -91,6 +94,8 @@ function makeDeps(overrides: {
   loadPublishedAgentConfig?: ReturnType<typeof vi.fn>;
   classifyIntent?: ReturnType<typeof vi.fn>;
   consultarJev?: ReturnType<typeof vi.fn>;
+  temIaDeSempre?: ReturnType<typeof vi.fn>;
+  agenteDaCampanha?: ReturnType<typeof vi.fn>;
 }) {
   return {
     log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -99,6 +104,9 @@ function makeDeps(overrides: {
     loadPublishedAgentConfig: overrides.loadPublishedAgentConfig ?? vi.fn(),
     classifyIntent: overrides.classifyIntent ?? vi.fn(),
     consultarJev: overrides.consultarJev ?? jevFalso().consultarJev,
+    // A empresa tem a IA de sempre, salvo o caso que prova o contrário (decisão B).
+    temIaDeSempre: overrides.temIaDeSempre ?? vi.fn().mockResolvedValue(true),
+    ...(overrides.agenteDaCampanha ? { agenteDaCampanha: overrides.agenteDaCampanha } : {}),
   } as never;
 }
 
@@ -236,14 +244,25 @@ describe('resolveTurnAgent', () => {
     expect(out.config?.agentId).toBe('agent-vendas');
   });
 
-  it('9. erro inesperado no router (ex.: DB fora do ar) nunca derruba o turno — cai no loadPublishedAgentConfig atual', async () => {
-    const loadActiveRouter = vi.fn().mockRejectedValue(new Error('db timeout'));
+  it('9. erro DEPOIS de o router carregar (sem regra por remetente) não derruba o turno — cai no loadPublishedAgentConfig atual', async () => {
+    const loadActiveRouter = vi.fn().mockResolvedValue(router());
     const loadPublishedAgentConfig = vi.fn().mockResolvedValue(fakeConfig('agent-sessao'));
+    const agenteDaCampanha = vi.fn().mockRejectedValue(new Error('db timeout'));
     const out = await resolveTurnAgent({} as never, {} as never,
       { ...baseInput, signal: 'oi', stickyAgentId: null, stickyIntent: null },
-      makeDeps({ loadActiveRouter, loadPublishedAgentConfig }));
+      makeDeps({ loadActiveRouter, loadPublishedAgentConfig, agenteDaCampanha }));
+    expect(agenteDaCampanha).toHaveBeenCalled();
     expect(out.outcome).toBe('classifier_failed');
     expect(out.config?.agentId).toBe('agent-sessao');
+  });
+
+  it('9b. falha ao CARREGAR o router (ex.: DB fora do ar) não cai no agente da sessão — sem saber se há regra por remetente, o turno não segue', async () => {
+    const loadActiveRouter = vi.fn().mockRejectedValue(new Error('db timeout'));
+    const loadPublishedAgentConfig = vi.fn().mockResolvedValue(fakeConfig('agent-sessao'));
+    await expect(resolveTurnAgent({} as never, {} as never,
+      { ...baseInput, signal: 'oi', stickyAgentId: null, stickyIntent: null },
+      makeDeps({ loadActiveRouter, loadPublishedAgentConfig }))).rejects.toThrow('db timeout');
+    expect(loadPublishedAgentConfig).not.toHaveBeenCalled();
   });
 
   it('10. sticky + classificador devolve null → mantém o agente sticky (review T4 finding 1)', async () => {
@@ -345,8 +364,24 @@ describe('resolveTurnAgent', () => {
 });
 
 describe('resolveConversationTurn — contexto curto do classificador', () => {
+  type SignalRowMock = {
+    id: string;
+    body: string | null;
+    type?: string;
+    media_url?: string | null;
+    media_storage_path?: string | null;
+    media_derived_text?: string | null;
+  };
+  type ContextoMock = {
+    direction: string;
+    body: string;
+    type?: string;
+    media_url?: string | null;
+    media_storage_path?: string | null;
+    media_derived_text?: string | null;
+  };
   /** Banco falso por consulta: conversa com agente fixo, a última inbound e o contexto (mais recente primeiro, como o SQL devolve). */
-  function fakeDb(signalRow: { id: string; body: string | null } | null, contextoDesc: { direction: string; body: string }[]) {
+  function fakeDb(signalRow: SignalRowMock | null, contextoDesc: ContextoMock[]) {
     return {
       query: vi.fn(async (sql: string, _values: unknown[]) => {
         if (sql.includes('from conversations')) return { rows: [{ active_ai_agent_id: 'agent-vendas', active_intent: 'vendas' }] };
@@ -355,7 +390,7 @@ describe('resolveConversationTurn — contexto curto do classificador', () => {
       }),
     };
   }
-  function deps() {
+  function deps(consultarJev?: ReturnType<typeof vi.fn>) {
     const classifyIntent = vi.fn().mockResolvedValue({ intentName: 'vendas', confidence: 0.9 });
     return {
       classifyIntent,
@@ -363,6 +398,7 @@ describe('resolveConversationTurn — contexto curto do classificador', () => {
         loadActiveRouter: vi.fn().mockResolvedValue(router()),
         loadPublishedAgentConfigById: idAwareLoader(),
         classifyIntent,
+        consultarJev,
       }),
     };
   }
@@ -378,7 +414,7 @@ describe('resolveConversationTurn — contexto curto do classificador', () => {
     expect(out.outcome).toBe('sticky');
     const [sql, values] = db.query.mock.calls.find(([q]) => q.includes('id<>$3'))!;
     expect(sql).toContain('organization_id=$1 and conversation_id=$2');
-    expect(values).toEqual(['org-1', 'conv-1', 'msg-atual', 4]);
+    expect(values).toEqual(['org-1', 'conv-1', 'msg-atual', 16]);
     expect(classifyIntent.mock.calls[0]![2]).toMatchObject({
       signal: 'Primeira',
       recentMessages: [
@@ -402,12 +438,73 @@ describe('resolveConversationTurn — contexto curto do classificador', () => {
     expect(classifyIntent).not.toHaveBeenCalled();
   });
 
-  it('inbound sem texto (mídia) não consulta contexto: o classificador nem roda', async () => {
-    const db = fakeDb({ id: 'msg-audio', body: null }, []);
+  it('áudio transcrito classifica: o sinal vira o texto composto da transcrição', async () => {
+    const db = fakeDb(
+      { id: 'msg-audio', body: null, type: 'audio', media_storage_path: 'p0', media_derived_text: 'Que dia você teria vaga para a consulta?' },
+      [],
+    );
+    const { classifyIntent, deps: d } = deps();
+    await resolveConversationTurn(db as never, {} as never, { ...baseInput, inbound: true }, d);
+    expect(classifyIntent).toHaveBeenCalled();
+    const args = classifyIntent.mock.calls[0]![2];
+    expect(args.signal).toContain('Que dia você teria vaga para a consulta?');
+  });
+
+  it('áudio sem transcrição, como hoje, mantém o agente sticky: o classificador nem roda', async () => {
+    const db = fakeDb({ id: 'msg-audio', body: null, type: 'audio', media_storage_path: 'p0' }, []);
     const { classifyIntent, deps: d } = deps();
     await resolveConversationTurn(db as never, {} as never, { ...baseInput, inbound: true }, d);
     expect(db.query.mock.calls.some(([q]) => q.includes('id<>$3'))).toBe(false);
     expect(classifyIntent).not.toHaveBeenCalled();
+  });
+
+  it('o contexto curto inclui a transcrição de uma mídia anterior', async () => {
+    const db = fakeDb(
+      { id: 'msg-audio', body: null, type: 'audio', media_storage_path: 'p0', media_derived_text: 'Quero marcar uma consulta' },
+      [
+        { direction: 'outbound', body: 'Qual data prefere?' },
+        { direction: 'inbound', body: 'x', type: 'audio', media_storage_path: 'p1', media_derived_text: 'Pode ser amanhã' },
+      ],
+    );
+    const { classifyIntent, deps: d } = deps();
+    await resolveConversationTurn(db as never, {} as never, { ...baseInput, inbound: true }, d);
+    const recent = classifyIntent.mock.calls[0]![2].recentMessages;
+    // mais antiga primeiro; a mídia anterior está composta pela transcrição.
+    expect(recent).toEqual([
+      { direction: 'inbound', body: expect.stringContaining('Pode ser amanhã') },
+      { direction: 'outbound', body: 'Qual data prefere?' },
+    ]);
+  });
+
+  it('texto digitado não muda: o sinal é o próprio corpo e o Jev recebe o corpo', async () => {
+    const consultarJev = vi.fn().mockReturnValue({
+      estado: Promise.resolve('desligada'),
+      escolha: Promise.resolve(null),
+      observar: vi.fn(),
+    });
+    const db = fakeDb({ id: 'msg-texto', body: 'Quero marcar uma consulta' }, []);
+    const { classifyIntent, deps: d } = deps(consultarJev);
+    await resolveConversationTurn(db as never, {} as never, { ...baseInput, inbound: true }, d);
+    expect(classifyIntent.mock.calls[0]![2].signal).toBe('Quero marcar uma consulta');
+    const entrada = consultarJev.mock.calls[0]![1] as unknown as { mensagem: string };
+    expect(entrada.mensagem).toBe('Quero marcar uma consulta');
+  });
+
+  it('para áudio transcrito o Jev recebe só o texto digitado (vazio), nunca a transcrição (R4)', async () => {
+    const consultarJev = vi.fn().mockReturnValue({
+      estado: Promise.resolve('desligada'),
+      escolha: Promise.resolve(null),
+      observar: vi.fn(),
+    });
+    const db = fakeDb(
+      { id: 'msg-audio', body: null, type: 'audio', media_storage_path: 'p0', media_derived_text: 'Que dia tem vaga?' },
+      [],
+    );
+    const { deps: d } = deps(consultarJev);
+    await resolveConversationTurn(db as never, {} as never, { ...baseInput, inbound: true }, d);
+    expect(consultarJev).toHaveBeenCalled();
+    const entrada = consultarJev.mock.calls[0]![1] as unknown as { mensagem: string };
+    expect(entrada.mensagem).toBe('');
   });
 });
 
@@ -440,6 +537,7 @@ describe('o Jev no roteador (onda 2 do Jev, bloco 2.2)', () => {
     jev: ReturnType<typeof jevFalso>;
     entrada?: Parameters<typeof resolveTurnAgent>[2];
     r?: LoadedRouter;
+    temIaDeSempre?: ReturnType<typeof vi.fn>;
   }) {
     const classifyIntent = vi.fn().mockResolvedValue(opts.daIa);
     const out = await resolveTurnAgent({} as never, {} as never, opts.entrada ?? semSticky, makeDeps({
@@ -447,6 +545,7 @@ describe('o Jev no roteador (onda 2 do Jev, bloco 2.2)', () => {
       loadPublishedAgentConfigById: idAwareLoader(),
       classifyIntent,
       consultarJev: opts.jev.consultarJev,
+      ...(opts.temIaDeSempre ? { temIaDeSempre: opts.temIaDeSempre } : {}),
     }));
     return { out, classifyIntent };
   }
@@ -517,6 +616,53 @@ describe('o Jev no roteador (onda 2 do Jev, bloco 2.2)', () => {
     expect(out.config?.agentId).toBe('agent-vendas');
     // A cobertura deixa rastro: é ela que o cartão conta.
     expect(jev.jev.observar.mock.calls[0]![0]).toMatchObject({ decidiu: false, aIaCobriu: true });
+  });
+
+  it('sob demanda: escolha confiável do Jev roteia sem chamar a IA de sempre', async () => {
+    const jev = jevFalso('decidindo', Promise.resolve(escolha('suporte', 0.9, 'decidindo')), 'sob_demanda');
+    const { out, classifyIntent } = await rodar({ daIa: { intentName: 'vendas', confidence: 0.99 }, jev });
+    expect(out.config?.agentId).toBe('agent-suporte');
+    expect(classifyIntent).not.toHaveBeenCalled();
+    expect(jev.jev.observar.mock.calls[0]![0]).toMatchObject({ decidiu: true, vereditoDaIa: null });
+  });
+
+  it('sob demanda: falha ou confiança baixa chama a IA de sempre uma vez', async () => {
+    for (const resposta of [null, escolha('suporte', 0.3, 'decidindo')]) {
+      const jev = jevFalso('decidindo', Promise.resolve(resposta), 'sob_demanda');
+      const { out, classifyIntent } = await rodar({ daIa: { intentName: 'vendas', confidence: 0.95 }, jev });
+      expect(out.config?.agentId).toBe('agent-vendas');
+      expect(classifyIntent).toHaveBeenCalledOnce();
+      expect(jev.jev.observar.mock.calls[0]![0].vereditoDaIa).toBeNull();
+    }
+  });
+
+  describe('decisão B (doc 89) — sob demanda só onde a empresa tem a IA de sempre', () => {
+    it('sem a IA de sempre, o sob demanda não liga: compara, e sem resposta dela vale a regra de hoje', async () => {
+      const temIa = vi.fn().mockResolvedValue(false);
+      const jev = jevFalso('decidindo', Promise.resolve(escolha('suporte', 0.99, 'decidindo')), 'sob_demanda');
+      const { out, classifyIntent } = await rodar({ daIa: null, jev, temIaDeSempre: temIa });
+      // A IA de sempre é perguntada (comparação), e sem ela o Jev não decide (R2).
+      expect(classifyIntent).toHaveBeenCalledOnce();
+      expect(out.outcome).toBe('classifier_failed');
+      expect(out.config?.agentId).toBe('agent-reserva');
+      expect(jev.jev.observar.mock.calls[0]![0]).toMatchObject({ decidiu: false });
+      // A pergunta é a do turno, com o provedor do roteador.
+      expect(temIa.mock.calls[0]![2]).toBe(semSticky.tenantId);
+    });
+
+    it('com a IA de sempre, o mesmo pedido roteia pelo Jev sem chamá-la', async () => {
+      const jev = jevFalso('decidindo', Promise.resolve(escolha('suporte', 0.99, 'decidindo')), 'sob_demanda');
+      const { out, classifyIntent } = await rodar({ daIa: null, jev, temIaDeSempre: vi.fn().mockResolvedValue(true) });
+      expect(classifyIntent).not.toHaveBeenCalled();
+      expect(out.config?.agentId).toBe('agent-suporte');
+    });
+
+    it('em comparação, a pergunta nem é feita', async () => {
+      const temIa = vi.fn().mockResolvedValue(true);
+      const jev = jevFalso('decidindo', Promise.resolve(escolha('suporte', 0.99, 'decidindo')));
+      await rodar({ daIa: { intentName: 'vendas', confidence: 0.95 }, jev, temIaDeSempre: temIa });
+      expect(temIa).not.toHaveBeenCalled();
+    });
   });
 
   describe('R2 — sem a IA de sempre, vale a regra de hoje, NUNCA o Jev', () => {
@@ -635,5 +781,107 @@ describe('destinoDoVeredito — a régua única (regras 2 a 5, sem carregar agen
 
   it("sem agente de reserva no roteador, a reserva é o publicado da sessão — rótulo 'fallback' para os dois lados", () => {
     expect(agenteDoDestino(router(), destinoDoVeredito(router(), undefined, null, null))).toBe('fallback');
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// #2155 — a intenção escolhe o AGENTE e o card vai para o FUNIL do produto
+// ---------------------------------------------------------------------------
+describe('2155 — destino de funil na intenção casada', () => {
+  const comDestino = [
+    {
+      ...members[0]!,
+      destinationPipelineId: 'pipe-investimentos',
+      destinationStageId: 'stage-investimentos-1',
+    },
+    members[1]!,
+  ];
+
+  it('classificou → MESMO agente de antes E funil/etapa de destino da intenção', async () => {
+    const loadActiveRouter = vi.fn().mockResolvedValue(router({ sticky: false, members: comDestino }));
+    const classifyIntent = vi.fn().mockResolvedValue({ intentName: 'vendas', confidence: 0.9 });
+    const loadPublishedAgentConfigById = idAwareLoader();
+
+    const out = await resolveTurnAgent({} as never, {} as never,
+      { ...baseInput, signal: 'quero investir', stickyAgentId: null, stickyIntent: null },
+      makeDeps({ loadActiveRouter, classifyIntent, loadPublishedAgentConfigById }));
+
+    // As DUAS metades do defeito, presas juntas: agente escolhido E destino do card.
+    expect(out.outcome).toBe('classified');
+    expect(out.config?.agentId).toBe('agent-vendas');
+    expect(out.destinationPipelineId).toBe('pipe-investimentos');
+    expect(out.destinationStageId).toBe('stage-investimentos-1');
+  });
+
+  it('sticky também carrega o destino — o card é levado já na primeira mensagem', async () => {
+    const loadActiveRouter = vi.fn().mockResolvedValue(router({ sticky: true, members: comDestino }));
+    const classifyIntent = vi.fn().mockResolvedValue({ intentName: 'vendas', confidence: 0.9 });
+    const loadPublishedAgentConfigById = idAwareLoader();
+
+    const out = await resolveTurnAgent({} as never, {} as never,
+      { ...baseInput, signal: 'mais uma pergunta', stickyAgentId: 'agent-vendas', stickyIntent: 'vendas' },
+      makeDeps({ loadActiveRouter, classifyIntent, loadPublishedAgentConfigById }));
+
+    expect(out.outcome).toBe('sticky');
+    expect(out.config?.agentId).toBe('agent-vendas');
+    expect(out.destinationPipelineId).toBe('pipe-investimentos');
+    // O roteiro NÃO recomeça (regra antiga), mas o destino continua valendo.
+    expect(out.flowPointerId).toBeNull();
+  });
+
+  it('intenção SEM destino declarado → null: instalação com um funil não muda', async () => {
+    const loadActiveRouter = vi.fn().mockResolvedValue(router({ sticky: false }));
+    const classifyIntent = vi.fn().mockResolvedValue({ intentName: 'vendas', confidence: 0.9 });
+    const loadPublishedAgentConfigById = idAwareLoader();
+
+    const out = await resolveTurnAgent({} as never, {} as never,
+      { ...baseInput, signal: 'quanto custa?', stickyAgentId: null, stickyIntent: null },
+      makeDeps({ loadActiveRouter, classifyIntent, loadPublishedAgentConfigById }));
+
+    expect(out.outcome).toBe('classified');
+    expect(out.destinationPipelineId).toBeNull();
+  });
+
+  it("caminho de reserva (fallback) NÃO herda destino de intenção nenhuma", async () => {
+    const loadActiveRouter = vi.fn().mockResolvedValue(router({ sticky: false, fallbackAgentId: 'agent-reserva', members: comDestino }));
+    const classifyIntent = vi.fn().mockResolvedValue({ intentName: 'inexistente', confidence: 0.99 });
+    const loadPublishedAgentConfigById = idAwareLoader();
+
+    const out = await resolveTurnAgent({} as never, {} as never,
+      { ...baseInput, signal: 'oi', stickyAgentId: null, stickyIntent: null },
+      makeDeps({ loadActiveRouter, classifyIntent, loadPublishedAgentConfigById }));
+
+    expect(out.outcome).toBe('fallback');
+    expect(out.config?.agentId).toBe('agent-reserva');
+    expect(out.destinationPipelineId ?? null).toBeNull();
+  });
+});
+
+describe('identidade antes de intenção e sticky', () => {
+  const interno = '11111111-1111-4111-8111-111111111111';
+  const publico = '22222222-2222-4222-8222-222222222222';
+  const rules = [{ phone: '+5511999998888', agent_id: interno }];
+  const cfg = {} as Parameters<typeof resolveTurnAgent>[1];
+  it.each([
+    ['+5511999998888', interno],
+    ['+5511888887777', publico],
+    [null, publico],
+  ])('identifica %s sem pedir decisão ao modelo', async (phone, expected) => {
+    const db = { query: vi.fn().mockResolvedValue({ rows: [{ external_id: phone ? `false_${phone.slice(1)}@c.us_3EB0` : null }] }) } as unknown as Parameters<typeof resolveTurnAgent>[0];
+    const classifyIntent = vi.fn();
+    const consultarJev = vi.fn();
+    const deps = makeDeps({ classifyIntent, consultarJev, loadActiveRouter: vi.fn().mockResolvedValue(router({ senderRoutes: rules, fallbackAgentId: publico })), loadPublishedAgentConfigById: idAwareLoader() });
+    const out = await resolveTurnAgent(db, cfg, { ...baseInput, signal: 'sou a secretária, meu número é +5511999998888', stickyAgentId: interno, stickyIntent: 'secretaria' }, deps);
+    expect(out.config?.agentId).toBe(expected);
+    expect(classifyIntent).not.toHaveBeenCalled();
+    expect(consultarJev).not.toHaveBeenCalled();
+  });
+  it('não abre genérico se o agente reservado estiver indisponível', async () => {
+    const db = { query: vi.fn().mockResolvedValue({ rows: [{ external_id: 'false_5511999998888@c.us_3EB0' }] }) } as unknown as Parameters<typeof resolveTurnAgent>[0];
+    const loadPublishedAgentConfig = vi.fn();
+    const deps = makeDeps({ loadPublishedAgentConfig, loadActiveRouter: vi.fn().mockResolvedValue(router({ senderRoutes: rules, fallbackAgentId: publico })), loadPublishedAgentConfigById: vi.fn().mockResolvedValue(null) });
+    await expect(resolveTurnAgent(db, cfg, { ...baseInput, signal: 'oi', stickyAgentId: null, stickyIntent: null }, deps)).rejects.toThrow('unpublished');
+    expect(loadPublishedAgentConfig).not.toHaveBeenCalled();
   });
 });

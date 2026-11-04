@@ -25,6 +25,7 @@ import { respostaDeRecusa } from "@/lib/api/recusa";
 import { fail, ok } from "@/lib/api/wrappers";
 import { requireRole } from "@/lib/auth/require-role";
 import { criarEtapa } from "@/lib/leads/stage-operations";
+import { anexaFluxos, carregaFluxosPorEtapa } from "@/lib/followup/fluxos-da-etapa";
 import { createClient } from "@/lib/supabase/server";
 import { traduzir } from "@/lib/i18n/dicionario";
 
@@ -36,7 +37,17 @@ interface RouteCtx {
 
 // `.max(80)`: o nome é o topo de uma coluna do quadro, não um parágrafo. O banco
 // não limita, mas a tela quebra muito antes disso.
-const bodySchema = z.object({ name: z.string().min(1).max(80) }).strict();
+//
+// `expected_duration_hours` é opcional e aceita `null`: uma etapa nasce sem
+// janela configurada e o radar cai no padrão de 24 h/72 h. 1 a 8760 inteiro
+// (uma hora a um ano) — a coluna é `numeric` sem CHECK, então este Zod é a
+// primeira rede (a migration com CHECK ficou fora deste escopo, #1532).
+const bodySchema = z
+  .object({
+    name: z.string().min(1).max(80),
+    expected_duration_hours: z.number().int().min(1).max(8760).nullable().optional(),
+  })
+  .strict();
 
 /**
  * GET — as etapas vivas do funil, na ordem do quadro.
@@ -60,14 +71,34 @@ export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
   const supabase = await createClient();
   const { data, error } = await supabase
     .from("crm_stages")
-    .select("id, name, position, is_won, is_lost")
+    // A janela de esfriando, a chance de fechamento e o aviso de equipe entram
+    // na leitura como as demais colunas de configuração: quem precisa "escolha
+    // a etapa" também precisa saber quanto tempo cada uma leva, qual a
+    // probabilidade calibrada pelo gestor e se a etapa abre aviso na Central —
+    // e sem elas aqui, a tela de configurações do funil mostra os campos vazios
+    // logo depois de salvar (issue #2999).
+    .select(
+      "id, name, position, is_won, is_lost, expected_duration_hours, win_probability, avisar_na_central",
+    )
     .eq("organization_id", authz.org.orgId)
     .eq("pipeline_id", id)
     .eq("is_archived", false)
     .order("position", { ascending: true });
   if (error) return fail("internal_error", t("Falha ao listar etapas."), 500, { requestId });
 
-  return ok(data ?? [], { requestId });
+  // #3603 — a lista read-only de «quais fluxos disparam ao entrar nesta etapa».
+  // Nenhuma consulta por etapa, e as MESMAS portas do motor
+  // (`lib/followup/fluxos-da-etapa.ts`). Se esta leitura falhar, a resposta sai
+  // SEM o campo — a tela então não afirma nem "tem" nem "não tem" —, em vez de
+  // derrubar uma listagem de etapas que já foi lida com sucesso.
+  let fluxos: Awaited<ReturnType<typeof carregaFluxosPorEtapa>> | null = null;
+  try {
+    fluxos = await carregaFluxosPorEtapa(supabase, authz.org.orgId);
+  } catch {
+    fluxos = null;
+  }
+
+  return ok(anexaFluxos((data ?? []) as Array<{ id: string }>, fluxos), { requestId });
 }
 
 export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
@@ -105,7 +136,14 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
         actor: { type: "user", id: authz.user.id, role: authz.org.role },
         requestId,
       },
-      { pipelineId, nome: parsed.data.name },
+      {
+        pipelineId,
+        nome: parsed.data.name,
+        // Só quando veio pedido: a chave ausente é o comportamento de hoje.
+        ...(parsed.data.expected_duration_hours !== undefined
+          ? { expected_duration_hours: parsed.data.expected_duration_hours }
+          : {}),
+      },
     );
     return ok(funil, { status: 201, requestId });
   } catch (err) {

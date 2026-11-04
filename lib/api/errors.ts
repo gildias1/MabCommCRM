@@ -12,6 +12,11 @@ export const ApiErrorCodes = {
   invalid_request: "invalid_request",
   validation_failed: "validation_failed", // Zod retornou erros de schema (422 também aceita)
   invalid_cursor: "invalid_cursor",
+  // POST /api/v1/avisos (#1418): `publicar_em` no futuro é recusado
+  // porque nada publica o aviso depois — gravar seria criar um recado que
+  // nunca chega. Código próprio para a tela distinguir de "corpo inválido" e
+  // oferecer o caminho: publicar agora ou enviar sem data.
+  aviso_agendado_nao_suportado: "aviso_agendado_nao_suportado",
 
   // Configuração de agentes: validação/estado ou indisponibilidade do provedor.
   prospecting_agent_session_failed: "prospecting_agent_session_failed",
@@ -33,6 +38,11 @@ export const ApiErrorCodes = {
   forbidden: "forbidden",
   forbidden_role: "forbidden_role",
   forbidden_tenant: "forbidden_tenant",
+  // Conta da empresa suspensa (spec da cobrança §4): sessão, token `dsk_` e MCP.
+  // Só LGPD e cobrança passam, por `requireRole({ permiteOrgSuspensa: true })`.
+  org_suspended: "org_suspended",
+  // Platform admin `support_readonly` tentando ESCREVER (`requirePlatformAdminEscrita`).
+  forbidden_scope: "forbidden_scope",
   lgpd_anonymization_irreversible: "lgpd_anonymization_irreversible",
 
   // 404
@@ -70,6 +80,36 @@ export const ApiErrorCodes = {
   // retentar depois resolve, enquanto conflito manda trocar a chave.
   idempotency_in_progress: "idempotency_in_progress",
   state_conflict: "state_conflict",
+  // Escrita vinda de uma aba que ficou numa organização diferente da do cookie
+  // `active_org` (#2335). O header `X-Org-Da-Aba` só serve para RECUSAR: a org
+  // efetiva continua sendo a do cookie (`lib/auth/require-role.ts`).
+  org_divergente: "org_divergente",
+  // POST /admin/tenants/[id]/reactivate sobre suspensão por falta de pagamento:
+  // a saída é "Dar prazo" ou "Tornar isenta", nunca o "Reativar" genérico.
+  suspensao_de_cobranca: "suspensao_de_cobranca",
+  // Rotas do dono da cobrança (spec da cobrança do revendedor §7e, §7g).
+  // PATCH de plano que muda preço ou intervalo com assinante (em plano_id ou
+  // plano_agendado_id): a saída é arquivar e criar outro.
+  plano_com_assinantes: "plano_com_assinantes",
+  // Troca de plano com a assinatura em dívida (em_atraso/cancelada) ou com o
+  // teste grátis vencido sem pagamento.
+  pagamento_pendente: "pagamento_pendente",
+  // Limite do plano: o gatilho de assentos ou de canais recusou (PT402,
+  // `details` = { recurso, limite }), ou a troca de plano não cabe no uso
+  // (`details.excedente`). Spec cobrança §5.
+  plan_limit_reached: "plan_limit_reached",
+  // POST /admin/tenants/[id]/delete sobre suspensão por falta de pagamento:
+  // excluir deixaria a assinatura cobrando no provedor. Irmão do de cima.
+  exclusao_com_cobranca_pendente: "exclusao_com_cobranca_pendente",
+  // POST /admin/tenants/[id]/delete sobre empresa suspensa pelo ADMINISTRADOR
+  // que ainda tem assinatura viva no provedor: o gatilho da migration 0601
+  // recusa a exclusão (PT409 organizacao_com_assinatura_viva). Não é falta de
+  // pagamento — é cobrança que seguiria correndo sem ninguém para cancelar.
+  exclusao_com_assinatura_viva: "exclusao_com_assinatura_viva",
+  // POST /admin/tenants/[id]/suspend|reactivate quando o descarte da fila bate
+  // na trava do aviso do Meet (`appointment_notice_busy`, 40001): outra escrita
+  // do mesmo contato está em curso. Nada foi gravado; tentar de novo resolve.
+  retry_later: "retry_later",
   invalid_state: "invalid_state", // resposta a um agent_case que saiu de awaiting_human (spec 15 §7)
   tenant_already_exists: "tenant_already_exists",
   // POST /api/v1/settings/api-tokens quando a organização já está no teto de
@@ -81,19 +121,82 @@ export const ApiErrorCodes = {
   // (índice uniq_contacts_org_phone). O corpo traz `details.contact_id` para a
   // tela oferecer o contato existente em vez de só mostrar que deu erro.
   contact_exists: "contact_exists",
+  // POST/PATCH /api/v1/attendants/sectors com nome que já existe na organização
+  // (índice attendant_sectors_org_name_unique, migration 0801).
+  sector_name_taken: "sector_name_taken",
   duplicate_external_id: "duplicate_external_id",
   event_gone: "event_gone", // resend de run cujo event_log original foi apagado (on delete set null)
   no_actions_to_resend: "no_actions_to_resend", // resend de regra que não tem mais nenhuma ação de webhook — reenviar nada não é sucesso
   next_action_absent: "next_action_absent", // decisão sobre proposta que não existe (mais) [wave 4]
   next_action_changed: "next_action_changed", // o agente reescreveu a proposta entre o render e o clique
   channel_archived: "channel_archived", // ação sobre canal que o usuário excluiu (a linha só sobrevive como âncora das FKs)
+  // POST /api/v1/ai/followups/enrollments numa instalação SEM número conectado
+  // (#3923): `fn_service_begin` levanta `service_channel_not_found` e o banco
+  // está certo — sem canal não há conversa para abrir. Era 500 sem corpo; agora
+  // é 409 com esta código estável, e a tela troca a frase genérica por "conecte
+  // um número". 409 e não 422: o corpo do pedido está correto, quem não está
+  // pronto é o estado da instalação.
+  service_channel_not_found: "service_channel_not_found",
   knowledge_source_type_in_use: "knowledge_source_type_in_use", // fonte ATIVA do mesmo tipo no agente — era o índice ai_knowledge_sources_unique_per_agent, que a 0181 derrubou; nenhuma rota emite mais este código
   voice_already_paired: "voice_already_paired", // POST /voice/sessions/pair com aparelho já vinculado — a saída é DELETE /voice/sessions, nunca re-parear por cima (ver a rota)
 
   // 422 — semântica
   unprocessable_entity: "unprocessable_entity",
+  // 422, e é PRODUTO, não erro: o aviso do art. 12.º vale só para organizações
+  // FORA do Brasil (decisão de 2026-10-16). A organização brasileira não recebe
+  // "recusa parcial" — recebe a porta fechada, e a recebe ANTES de o e-mail
+  // sair, de o `due_at` ser tocado e de a auditoria registrar o aviso.
+  lgpd_art12_so_fora_do_brasil: "lgpd_art12_so_fora_do_brasil",
+  plano_invalido: "plano_invalido", // plano inexistente, arquivado, de outro intervalo, ou cobrança desligada
+  // #2846: cobrança ligada, planos oferecidos e nenhum plano padrão — a empresa
+  // não nasce sem plano (doc 146). Quem administra define um padrão.
+  plano_obrigatorio: "plano_obrigatorio",
+  // Cobrança do revendedor, PR 3a (spec §7a–§7g, §13). O provedor fora do ar é
+  // 503 e o provedor que recusou é 502: a tela diz "tente de novo" num caso e
+  // "confira os dados" no outro.
+  provedor_indisponivel: "provedor_indisponivel",
+  provedor_recusou: "provedor_recusou",
+  // A instalação ainda não conectou provedor (a empresa lê "o administrador ainda não conectou a cobrança").
+  provedor_nao_conectado: "provedor_nao_conectado",
+  // Trocar de provedor, ou pôr chave de teste no lugar da de produção, com empresas pagando de verdade.
+  provedor_com_assinaturas: "provedor_com_assinaturas",
+  // Trocar a chave de teste pela de produção devolve ao teste grátis quem assinou em teste (D-7): pede confirmação.
+  publicacao_requer_confirmacao: "publicacao_requer_confirmacao",
+  // A chave não passou no teste do provedor (`details.motivo`).
+  chave_recusada: "chave_recusada",
+  // Sem https público o provedor não entrega os avisos de pagamento.
+  url_publica_invalida: "url_publica_invalida",
+  // Outro clique está gerando o link de pagamento desta empresa (reserva de 2 min).
+  checkout_em_preparo: "checkout_em_preparo",
+  // Troca de plano recusada enquanto houver link de pagamento em aberto.
+  checkout_em_aberto: "checkout_em_aberto",
+  // Já existe assinatura esperando o 1º pagamento (`details.link_de_pagamento`).
+  pagamento_em_andamento: "pagamento_em_andamento",
+  // Tornar isenta exige cancelar antes no provedor.
+  assinatura_viva_no_provedor: "assinatura_viva_no_provedor",
+  // O provedor não oferece portal para esta assinatura.
+  sem_portal: "sem_portal",
+  // A chave nova é de OUTRA conta do provedor: os clientes que já pagam não existem nela.
+  chave_de_outra_conta: "chave_de_outra_conta",
+  // Em atraso sem fatura pagável agora (ex.: assinatura pausada): o caminho é o portal.
+  sem_link_de_pagamento: "sem_link_de_pagamento",
+  // Cobrança do revendedor, PR 3b (Asaas). O CPF/CNPJ de quem paga vai direto ao
+  // provedor e não é guardado: dígitos que não conferem, ausente quando o Asaas
+  // exige, ou com os dígitos certos e recusado pelo provedor.
+  documento_invalido: "documento_invalido",
+  documento_obrigatorio: "documento_obrigatorio",
+  documento_recusado: "documento_recusado",
+  // O cliente no provedor ainda não existe e nenhum admin da empresa tem e-mail (link gerado pelo dono, D-15).
+  empresa_sem_email: "empresa_sem_email",
+  // O Asaas recusa trocar o plano com a cobrança do período em uso ainda pendente (spec §6.2, §7e).
+  pagamento_do_periodo_pendente: "pagamento_do_periodo_pendente",
   channel_without_session: "channel_without_session", // operação de sessão (reiniciar, parear) pedida a canal que não tem sessão no transporte — o oficial
   janela_fechada: "janela_fechada", // POST /messages por token/agente com texto livre fora das 24h em canal com restrição (131047) — a saída é modelo aprovado (#1614)
+  // POST /api/v1/messages/{id}/retry (lib/messaging/reenvio.ts): a regra não permite reenviar (403),
+  // a mensagem pode ter chegado e falta a confirmação (409), ou outro toque já travou a linha (409).
+  reenvio_indisponivel: "reenvio_indisponivel",
+  confirmacao_necessaria: "confirmacao_necessaria",
+  reenvio_em_curso: "reenvio_em_curso",
   invalid_state_transition: "invalid_state_transition",
   invalid_owner: "invalid_owner", // novo dono não é membro ativo agent+ da org (bulk assign, G3-04)
   trigger_kind_not_implemented: "trigger_kind_not_implemented", // publish de followup-flow com kind sem motor de enrollment (stage_change/conversation_end)
@@ -255,11 +358,20 @@ export const ApiErrorCodes = {
   campanha_agenda_invalida: "campanha_agenda_invalida", // 422: data no passado
   campanha_conteudo_invalido: "campanha_conteudo_invalido", // 422: texto vazio ou variável que não existe
   campanha_base_legal_invalida: "campanha_base_legal_invalida", // 422: interesse legítimo sem referência da LIA
+  // Migration 0710 (#1330, fatia 4): campanha pelo número oficial com modelo aprovado.
+  campanha_modo_do_canal: "campanha_modo_do_canal", // 422: texto livre em número oficial, ou modelo em número por QR
+  campanha_modelo_um_numero: "campanha_modelo_um_numero", // 422: modelo aprovado sai por um número só
+  campanha_modelo_inexistente: "campanha_modelo_inexistente", // 422: o modelo não existe neste número
+  campanha_modelo_nao_aprovado: "campanha_modelo_nao_aprovado", // 422: modelo pausado, recusado ou em análise
+  campanha_modelo_variaveis: "campanha_modelo_variaveis", // 422: variável sem origem, ou origem que não serve
+  // Migration 0711: envio rápido (rajada) só pelo número oficial, com modelo aprovado.
+  campanha_velocidade_do_canal: "campanha_velocidade_do_canal", // 422: envio rápido pedido num número por QR
 
   // 500 / upstream
   internal_error: "internal_error",
   upstream_unavailable: "upstream_unavailable",
   unavailable: "unavailable", // 503: dependência de config ausente (ex.: pool do engine sem SUPABASE_DB_URL)
+  base_publica_nao_configurada: "base_publica_nao_configurada", // 503: NEXT_PUBLIC_APP_URL ausente, placeholder ou da própria máquina — o webhook único da instalação não é registrado
   waha_error: "waha_error",
   channel_unavailable: "channel_unavailable", // 502: o transporte do canal não respondeu (ex.: listar grupos com a sessão fora de WORKING)
   wacalls_error: "wacalls_error", // 502: o serviço de chamada de voz recusou ou não respondeu

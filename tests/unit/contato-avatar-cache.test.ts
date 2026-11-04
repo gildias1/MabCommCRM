@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
 
 /**
  * Cache do redirect da foto de perfil — GET /api/v1/contacts/{id}/avatar.
@@ -24,7 +25,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const SIGNED_URL = "https://storage.example/assinada?token=abc";
 
 let contatoRow: { avatar_storage_path: string | null; is_anonimizado: boolean } | null = null;
-let orgAtiva: { orgId: string } | null = { orgId: "org-1" };
+let orgAtiva: { orgId: string; org_status: string } | null = { orgId: "org-1", org_status: "active" };
 let erroDeAssinatura: { message: string } | null = null;
 
 // A assinatura tipada importa: o teste do TTL lê o 2º argumento que o handler
@@ -62,7 +63,7 @@ function chain(): Record<string, unknown> {
 vi.mock("@/lib/auth/server", () => ({
   mfaEmDivida: vi.fn(async () => false),
   loadAuthUser: async () => ({ id: "user-1" }),
-  resolveActiveOrg: async () => orgAtiva,
+  orgAtivaSemPortao: async () => orgAtiva,
 }));
 
 vi.mock("@/lib/supabase/admin", () => ({
@@ -74,14 +75,22 @@ vi.mock("@/lib/supabase/admin", () => ({
 
 const { GET } = await import("@/app/api/v1/contacts/[id]/avatar/route");
 
+/**
+ * A rota lê o cabeçalho `authorization` para escolher a porta (sessão do
+ * navegador OU chave de integração, #3420), então `req` precisa ser um
+ * `NextRequest` de verdade — o `{}` de antes não tinha `headers`. Sem
+ * cabeçalho nenhum: este arquivo prova o caminho do NAVEGADOR.
+ */
 function chamar(id = "contato-1") {
-  return GET({} as never, { params: Promise.resolve({ id }) });
+  return GET(new NextRequest(`http://localhost/api/v1/contacts/${id}/avatar`), {
+    params: Promise.resolve({ id }),
+  });
 }
 
 describe("GET /api/v1/contacts/{id}/avatar — cache do redirect", () => {
   beforeEach(() => {
     contatoRow = { avatar_storage_path: "org-1/avatars/contato-1.jpg", is_anonimizado: false };
-    orgAtiva = { orgId: "org-1" };
+    orgAtiva = { orgId: "org-1", org_status: "active" };
     erroDeAssinatura = null;
     createSignedUrl.mockClear();
   });

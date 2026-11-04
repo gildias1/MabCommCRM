@@ -39,7 +39,10 @@
  * dentro, com log, e o seguinte roda mesmo assim.
  */
 import { audit } from "@/lib/audit";
+import { idsDosCanaisDesativados } from "@/lib/channels/desativado";
+import { encerraDemanda } from "@/lib/leads/encerramento";
 import { garantirLeadDaConversa } from "@/lib/leads/nascimento-do-lead";
+import type { CanonicalLostReason } from "@/lib/schemas/leads";
 import {
   ehAPrimeiraMensagemDoContato,
   estamparOrigemDaPagina,
@@ -48,12 +51,20 @@ import {
 import { logger } from "@/lib/logger";
 import { PADRAO_DO_REF } from "@/lib/plataformas-de-anuncio/captura-de-clique";
 import { casarClickRef } from "@/lib/plataformas-de-anuncio/meta/captura-de-clique";
+import { casarOrigemPorHorario } from "@/lib/leads/origem-por-horario";
 import type { createAdminClient } from "@/lib/supabase/admin";
 import { ehPedidoDeOptOut } from "@/lib/opt-out/deteccao";
 import { ehContatoDoNumeroInterno } from "@/lib/escalacao/numero-interno-de-aviso";
-import { acelerarPipelineDeEventos } from "@/lib/dev/kick-local-pipeline";
+import { acelerarFollowupDoInbound, drenarEventosDoInbound } from "@/lib/dev/kick-local-pipeline";
+import { origemDoNegocioPeloCanal } from "@/lib/channels/origem-do-negocio";
 import { autorizarContatoParaIA } from "@/lib/ai/elegibilidade/autorizacao";
 import { casarCampanha, lerCampanhas } from "@/lib/ai/elegibilidade/campanha";
+import { lerPessoalDoContato } from "@/lib/contacts/contato-pessoal";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { EventRow } from "@/lib/event-log/dispatcher";
+import { applyReactivityEvent, createSupabaseReactivityClient } from "@/lib/followup/reactivity";
+import { aplicarRespostaNaCampanha } from "@/lib/campanhas/resposta";
+import { marcarConversaComMensagem } from "@/lib/channels/marcar-conversa";
 
 type Admin = ReturnType<typeof createAdminClient>;
 
@@ -111,6 +122,15 @@ export interface EntradaDeMensagem {
    * lendo o `event_log` meses depois, se saiba por onde a mensagem entrou.
    */
   origem: string;
+  /**
+   * O valor de `conversations.channel` desta conversa (`instagram`,
+   * `facebook`…). Ausente quer dizer WhatsApp.
+   *
+   * Este sim decide: é dele que sai a origem do negócio que nasce
+   * (`origemDoNegocioPeloCanal`). Sem ele, o negócio do direct do Instagram
+   * nascia com `source = 'whatsapp'`.
+   */
+  canal?: string;
 }
 
 /**
@@ -143,19 +163,189 @@ export async function aplicarEfeitosPosEntrada(
   }
 
   await aplicarOptOut(admin, entrada);
+  // Contato pessoal (spec 21, etapa 6): a mensagem já está gravada, com o
+  // carimbo de não-lida que o ingest gravou — mas NADA nasce dela: sem negócio,
+  // sem campanha, sem follow-up, sem IA (fila e resposta). O STOP continua na
+  // frente: `aplicarOptOut` rodou acima de propósito, então um STOP de pessoal
+  // ainda bloqueia (a ordem 1-2-3 do cabeçalho não muda).
+  if (await ehContatoPessoal(admin, entrada)) {
+    logger.info("[pos-entrada] efeitos pulados: contato pessoal", {
+      organizationId: entrada.organizationId,
+      origem: entrada.origem,
+    });
+    return;
+  }
   await guardarOrigemDaPagina(admin, entrada);
   await abrirDemanda(admin, entrada);
   await avaliarCampanha(admin, entrada);
-  // A resposta do lead avança o follow-up AQUI. O despacho do agente (LLM)
-  // vem depois: no Hobby ele estoura o tempo da request e o próximo texto
-  // do fluxo ficava esperando o relógio.
-  await acelerarPipelineDeEventos(admin, {
+  const sinal = {
     organizationId: entrada.organizationId,
     contactId: entrada.contactId,
     messageId: entrada.messageId,
     texto: entrada.texto,
-  });
+  };
+  // UMA VOZ: a resposta do cliente avança o follow-up DESTE contato antes de o
+  // turno do agente ser pedido.
+  await acelerarFollowupDoInbound(admin, sinal);
   await pedirDespachoDoAgente(admin, entrada);
+  // O dreno do event_log vem DEPOIS do despacho: nenhum handler dele decide se
+  // o agente fala (o "cliente voltou" é previsto por `deveCederTurnoAoRetorno`
+  // nas duas ordens), e cada evento drenado aqui atrasava o pedido do turno.
+  await drenarEventosDoInbound(admin, sinal);
+}
+
+/**
+ * A mensagem recuperada de uma queda (Spec 32 §3): a entrada de `EntradaDeMensagem`
+ * com o que o efeito de "o cliente respondeu" precisa de mais. A hora é a REAL da
+ * mensagem, nunca `now()`: a recuperação chega dias depois, e a campanha e a reatividade
+ * comparam essa hora com a janela e com o último turno do follow-up.
+ */
+export type EntradaDaRecuperacao = EntradaDeMensagem & {
+  /** ISO da hora em que o cliente mandou a mensagem (vinda do acervo). */
+  enviadaEm: string;
+  /** A prévia que a conversa mostra na caixa (mesma regra do ao vivo). */
+  previa: string;
+};
+
+/**
+ * Só os efeitos de "o cliente respondeu" da mensagem recuperada (Spec 32 §3).
+ *
+ * NUNCA chama despacho do agente, demanda nova, guarda de origem de página nem
+ * drenagem de eventos: a mensagem é do passado, e acordar a IA ou abrir card por
+ * ela responderia a alguém que já foi atendido. Também não emite `message.received`:
+ * o efeito de follow-up roda com uma linha EM MEMÓRIA, que não entra no `event_log`.
+ *
+ * Guardas da ingestão, na mesma ordem: número interno de avisos e canal pausado
+ * não recebem nada; o pedido de PARE vale mesmo para contato pessoal (é regra de
+ * LGPD, a mesma da ingestão), e o restante é que é pulado para contato pessoal.
+ *
+ * Cada efeito falha para dentro, com log: um que falha não impede os outros nem
+ * para a rodada.
+ */
+export async function aplicarEfeitosDaRecuperacao(
+  admin: Admin,
+  entrada: EntradaDaRecuperacao,
+): Promise<void> {
+  try {
+    if (await ehContatoDoNumeroInterno(admin as unknown as SupabaseClient, entrada.organizationId, entrada.contactId)) {
+      return;
+    }
+    const desativados = await idsDosCanaisDesativados(admin as unknown as SupabaseClient, entrada.organizationId);
+    if (desativados.includes(entrada.channelSessionId)) {
+      logger.info("pos-entrada: recuperação pulada — canal desativado", {
+        organization_id: entrada.organizationId,
+        origem: entrada.origem,
+      });
+      return;
+    }
+
+    await passoDaRecuperacao("opt-out", () => aplicarOptOut(admin, entrada), entrada);
+    if (await ehContatoPessoal(admin, entrada)) {
+      logger.info("pos-entrada: recuperação pulada — contato pessoal", {
+        organization_id: entrada.organizationId,
+        origem: entrada.origem,
+      });
+      return;
+    }
+    await passoDaRecuperacao("campanha", () => avaliarCampanha(admin, entrada), entrada);
+
+    // Só a reatividade e o texto dos follow-ups: a mesma linha que o handler do
+    // event_log recebe, montada aqui e nunca gravada.
+    await passoDaRecuperacao(
+      "follow-up",
+      async () => {
+        const evento: EventRow = {
+          id: entrada.requestId ?? `recuperacao:${entrada.conversationId}:${entrada.enviadaEm}`,
+          organization_id: entrada.organizationId,
+          event_type: "message.received",
+          entity_kind: "message",
+          entity_id: null,
+          payload: {
+            message_id: null,
+            conversation_id: entrada.conversationId,
+            contact_id: entrada.contactId,
+            direction: "inbound",
+            channel_session_id: entrada.channelSessionId,
+            body_preview: entrada.texto ? entrada.texto.slice(0, 280) : null,
+            sent_at: entrada.enviadaEm,
+          },
+          metadata: { source: entrada.origem },
+          consumed_by: [],
+          attempts: 0,
+          created_at: entrada.enviadaEm,
+        };
+        // A mensagem é de antes da volta: ela pode PARAR o fluxo que pede cancelamento na resposta,
+        // mas nunca acordar a espera nem aplicar o texto como resposta (isso manda o próximo passo
+        // agora, a quem pode já ter sido atendido pelo celular).
+        await applyReactivityEvent(
+          createSupabaseReactivityClient(admin as unknown as SupabaseClient),
+          () => new Date(),
+          evento,
+          { semAcordar: true },
+        );
+      },
+      entrada,
+    );
+    await passoDaRecuperacao(
+      "resposta-de-campanha",
+      () =>
+        aplicarRespostaNaCampanha(admin as unknown as SupabaseClient, {
+          organizationId: entrada.organizationId,
+          contactId: entrada.contactId,
+          recebidoEm: new Date(entrada.enviadaEm),
+        }),
+      entrada,
+    );
+    await passoDaRecuperacao(
+      "conversa",
+      async () => {
+        // O carimbo da conversa só anda para a FRENTE: o que chegou ao vivo depois da volta já
+        // marcou uma hora mais nova, e a RPC grava o que recebe, sem `greatest`. Sem esta
+        // leitura a conversa voltava para a hora da mensagem velha, e a prévia mostrava o texto
+        // antigo no lugar do mais recente.
+        const { data } = await admin
+          .from("conversations")
+          .select("last_message_at")
+          .eq("organization_id", entrada.organizationId)
+          .eq("id", entrada.conversationId)
+          .maybeSingle();
+        const ultima = (data as { last_message_at?: string | null } | null)?.last_message_at;
+        if (ultima && Date.parse(ultima) >= Date.parse(entrada.enviadaEm)) return;
+        await marcarConversaComMensagem(admin as unknown as SupabaseClient, {
+          organizationId: entrada.organizationId,
+          conversationId: entrada.conversationId,
+          direction: "inbound",
+          preview: entrada.previa,
+          at: entrada.enviadaEm,
+          canal: "waha",
+        });
+      },
+      entrada,
+    );
+  } catch (err) {
+    logger.warn("pos-entrada: efeitos da recuperação falharam (a mensagem já está gravada)", {
+      organization_id: entrada.organizationId,
+      conversation_id: entrada.conversationId,
+      detail: err instanceof Error ? err.message.slice(0, 160) : "desconhecido",
+    });
+  }
+}
+
+/** Um efeito da recuperação: se falhar, registra e deixa os outros rodarem. */
+async function passoDaRecuperacao(
+  nome: string,
+  efeito: () => Promise<unknown>,
+  entrada: EntradaDeMensagem,
+): Promise<void> {
+  try {
+    await efeito();
+  } catch (err) {
+    logger.warn(`pos-entrada: efeito da recuperação falhou (${nome}); os demais seguem`, {
+      organization_id: entrada.organizationId,
+      conversation_id: entrada.conversationId,
+      detail: err instanceof Error ? err.message.slice(0, 160) : "desconhecido",
+    });
+  }
 }
 
 /**
@@ -222,6 +412,45 @@ async function avaliarCampanha(admin: Admin, entrada: EntradaDeMensagem): Promis
 }
 
 /**
+ * Contato marcado como pessoal (`contacts.is_personal`, spec 21).
+ *
+ * Fail-open de propósito, como o resto do arquivo: a mensagem JÁ está gravada;
+ * se a leitura falhar, o seguinte roda mesmo assim — e a segunda defesa (a
+ * recusa em `garantirLeadDaConversa`, `contato_pessoal`) continua valendo para
+ * o negócio. Uma exceção aqui viraria 500 para o provider e tempestade de
+ * reentregas.
+ *
+ * A CONSULTA não mora aqui: ela é `lib/contacts/contato-pessoal.ts`, a régua
+ * única da marca. Este arquivo só decide a POLÍTICA da dúvida (seguir), porque
+ * essa decisão é da entrada de mensagem — a derivação de mídia usa a mesma
+ * régua e decide o contrário (#3592: sem saber de quem é o arquivo, não gasta
+ * token).
+ */
+async function ehContatoPessoal(admin: Admin, entrada: EntradaDeMensagem): Promise<boolean> {
+  try {
+    const { pessoal, erro } = await lerPessoalDoContato(admin, {
+      organizationId: entrada.organizationId,
+      contactId: entrada.contactId,
+    });
+    if (erro) {
+      logger.warn("pos-entrada: leitura de is_personal falhou (os efeitos seguem)", {
+        organization_id: entrada.organizationId,
+        contact_id: entrada.contactId,
+        detail: erro,
+      });
+    }
+    return pessoal;
+  } catch (err) {
+    logger.warn("pos-entrada: leitura de is_personal falhou (os efeitos seguem)", {
+      organization_id: entrada.organizationId,
+      contact_id: entrada.contactId,
+      detail: err instanceof Error ? err.message.slice(0, 160) : "desconhecido",
+    });
+    return false;
+  }
+}
+
+/**
  * 1 · Quem pediu para sair, sai.
  *
  * O update é incondicional (não filtra por `is_blocked` atual) de propósito:
@@ -266,6 +495,211 @@ async function aplicarOptOut(admin: Admin, entrada: EntradaDeMensagem): Promise<
       origem: entrada.origem,
       detail: err instanceof Error ? err.message.slice(0, 160) : "desconhecido",
     });
+    // Sem o bloqueio gravado não há o que fechar: o contato segue recebendo, e
+    // fechar o negócio de quem o sistema não conseguiu proteger esconderia o
+    // problema no funil em vez de deixá-lo no log.
+    return;
+  }
+
+  await fecharNegociosAbertosDeQuemPediuParar(admin, entrada);
+  await encerrarDemandasAbertasDeQuemPediuParar(admin, entrada);
+}
+
+/**
+ * Motivo canônico de perda (`CANONICAL_LOST_REASONS`, migration 0513): "Pediu
+ * para não receber mensagens". Não é `requested_by_customer` ("Cliente solicitou
+ * cancelamento") — pedir silêncio não é cancelar (decisão do dono, doc 85).
+ */
+const MOTIVO_DA_PERDA_POR_OPT_OUT = "opted_out_of_messages" satisfies CanonicalLostReason;
+
+/**
+ * O DESFECHO do opt-out nas DEMANDAS (issue #3288): `encerrada_pelo_cliente`.
+ *
+ * Já é vocabulário fechado do banco (`demandas.desfecho`, migration 0222), ao
+ * lado de `perdida` e `expirada_sem_resposta` — não pede schema novo. Antes
+ * disto o opt-out fechava os CARDS (`opted_out_of_messages`), mas a demanda
+ * aberta do contato seguia no Radar acumulando: em 21/10 a prospecção abriu 26
+ * demandas num dia, as "derivada" sem card que ninguém vai tratar.
+ */
+const DESFECHO_DA_DEMANDA_POR_OPT_OUT = "encerrada_pelo_cliente" as const;
+
+/**
+ * O ATOR de todo o caminho de opt-out: a mensagem chegou pelo canal e o produto
+ * agiu — não foi uma pessoa. Nomeado para que o fechamento do CARD e o da
+ * DEMANDA usem a MESMA origem: duas cópias divergem na primeira vez que alguém
+ * trocar o id de um lado só.
+ */
+const ATOR_DO_OPT_OUT = { type: "webhook_source", id: "canal-inbound" } as const;
+
+/**
+ * Quem pediu para parar não é mais uma oportunidade: o negócio aberto dele vira
+ * "Perdido — Pediu para não receber mensagens". Inclusive pedido já pago — o
+ * dono escolheu fechar TODO negócio aberto (opção B, não B').
+ *
+ * Medido em produção: os dois opt-outs de um dia bloquearam o contato um segundo
+ * depois do "parar" (`contact.blocked`, sem usuário), mas o negócio ficou aberto
+ * na etapa de origem até um operador arrastá-lo à mão minutos depois. Enquanto
+ * isso o card seguia contando como demanda viva e sujando o radar de risco.
+ *
+ * Roda DEPOIS do bloqueio gravado e ANTES do nascimento do lead (o passo 2 já
+ * recusa contato bloqueado, então não nasce card novo para quem acabou de sair).
+ * Usa `encerraDemanda` — a mesma regra do botão "perdido" e da IA —, que é
+ * idempotente, filtra `organization_id`, grava a timeline e a auditoria.
+ *
+ * NUNCA lança: a mensagem já entrou e o bloqueio já foi gravado; uma falha aqui
+ * (funil sem etapa de perdido, por exemplo) fica no log e não derruba a ingestão.
+ */
+async function fecharNegociosAbertosDeQuemPediuParar(
+  admin: Admin,
+  entrada: EntradaDeMensagem,
+): Promise<void> {
+  try {
+    const { data, error } = await admin
+      .from("crm_leads")
+      .select("id")
+      .eq("organization_id", entrada.organizationId)
+      .eq("contact_id", entrada.contactId)
+      .eq("status", "open");
+    if (error) {
+      logger.warn("pos-entrada: negócios do contato que pediu para parar não lidos", {
+        organization_id: entrada.organizationId,
+        contact_id: entrada.contactId,
+        detail: error.message.slice(0, 160),
+      });
+      return;
+    }
+    for (const lead of (data ?? []) as Array<{ id: string }>) {
+      try {
+        await encerraDemanda(
+          admin,
+          {
+            organization_id: entrada.organizationId,
+            // `webhook_source`, como o nascimento do lead: a mensagem chegou pelo
+            // canal e o produto agiu — não foi uma pessoa. A timeline traduz para
+            // "sistema".
+            actor: ATOR_DO_OPT_OUT,
+            requestId: entrada.requestId ?? `opt-out:${entrada.conversationId}`,
+          },
+          {
+            leadId: lead.id,
+            desfecho: "lost",
+            motivo: MOTIVO_DA_PERDA_POR_OPT_OUT,
+            razaoNaTimeline: "O cliente pediu para não receber mais mensagens",
+            payloadNaTimeline: { conversation_id: entrada.conversationId },
+          },
+        );
+      } catch (err) {
+        logger.warn("pos-entrada: negócio de quem pediu para parar não foi fechado", {
+          organization_id: entrada.organizationId,
+          contact_id: entrada.contactId,
+          lead_id: lead.id,
+          detail: err instanceof Error ? err.message.slice(0, 160) : "desconhecido",
+        });
+      }
+    }
+  } catch (err) {
+    logger.warn("pos-entrada: fechamento dos negócios de quem pediu para parar falhou", {
+      organization_id: entrada.organizationId,
+      contact_id: entrada.contactId,
+      detail: err instanceof Error ? err.message.slice(0, 160) : "desconhecido",
+    });
+  }
+}
+
+/**
+ * O opt-out TAMBÉM encerra as DEMANDAS ABERTAS do contato (issue #3288).
+ *
+ * Fechar a conversa ou o caso só preenche o próximo passo; a demanda continuava
+ * aberta. É o outro lado do mesmo buraco que o fechamento dos cards acima fecha:
+ * quem pediu para parar sai do funil, mas seguia contando como demanda viva no
+ * Radar e empurrando o operador a resgatar o que já acabou.
+ *
+ * O desfecho é `encerrada_pelo_cliente` — pedir silêncio diz que AQUELE
+ * atendimento não anda mais. Passa pela MESMA porta do botão "encerrar" da tela
+ * (`fn_demanda_encerrar`, `app/api/v1/demandas/[id]/route.ts:89`): o CAS de
+ * revisão, a timeline e o `encerrada_por` são do banco — não se escreve
+ * `fechada_em` à mão aqui, senão passa a haver duas verdades sobre o que
+ * "encerrada" significa.
+ *
+ * Só as ABERTAS (`fechada_em is null`): demanda já encerrada não é tocada nem
+ * recebe rpc — encerrar de novo pela porta dos fundos seria efeito que ninguém
+ * pediu.
+ *
+ * `p_actor` vai `null`: a coluna referencia `auth.users` e o ator daqui é o
+ * SISTEMA, não uma pessoa. A origem do encerramento fica registrada na auditoria
+ * (`demanda.encerrada`, com o MESMO `ATOR_DO_OPT_OUT` do fechamento do card).
+ *
+ * NUNCA lança: a mensagem já entrou e o bloqueio já foi gravado; uma falha aqui
+ * (demanda que mudou de revisão entre a leitura e o rpc, por exemplo) fica no
+ * log e não derruba a ingestão.
+ */
+async function encerrarDemandasAbertasDeQuemPediuParar(
+  admin: Admin,
+  entrada: EntradaDeMensagem,
+): Promise<void> {
+  try {
+    const { data, error } = await admin
+      .from("demandas")
+      .select("id, revision")
+      .eq("organization_id", entrada.organizationId)
+      .eq("contact_id", entrada.contactId)
+      .is("fechada_em", null);
+    if (error) {
+      logger.warn("pos-entrada: demandas do contato que pediu para parar não lidas", {
+        organization_id: entrada.organizationId,
+        contact_id: entrada.contactId,
+        detail: error.message.slice(0, 160),
+      });
+      return;
+    }
+    for (const demanda of (data ?? []) as Array<{ id: string; revision: number }>) {
+      try {
+        const { error: encerraErro } = await admin.rpc("fn_demanda_encerrar", {
+          p_org: entrada.organizationId,
+          p_demanda: demanda.id,
+          p_expected: demanda.revision,
+          p_desfecho: DESFECHO_DA_DEMANDA_POR_OPT_OUT,
+          // `null` = não foi uma pessoa: `encerrada_por` referencia `auth.users`;
+          // o ator de sistema fica no audit abaixo.
+          p_actor: null as unknown as string,
+        });
+        if (encerraErro) {
+          logger.warn("pos-entrada: demanda de quem pediu para parar não encerrada", {
+            organization_id: entrada.organizationId,
+            contact_id: entrada.contactId,
+            demanda_id: demanda.id,
+            detail: encerraErro.message.slice(0, 160),
+          });
+          continue;
+        }
+        await audit({
+          action: "demanda.encerrada",
+          organizationId: entrada.organizationId,
+          resourceType: "demanda",
+          resourceId: demanda.id,
+          requestId: entrada.requestId ?? `opt-out:${entrada.conversationId}`,
+          metadata: {
+            desfecho: DESFECHO_DA_DEMANDA_POR_OPT_OUT,
+            contact_id: entrada.contactId,
+            actor_type: ATOR_DO_OPT_OUT.type,
+            actor_id: ATOR_DO_OPT_OUT.id,
+          },
+        });
+      } catch (err) {
+        logger.warn("pos-entrada: demanda de quem pediu para parar não encerrada", {
+          organization_id: entrada.organizationId,
+          contact_id: entrada.contactId,
+          demanda_id: demanda.id,
+          detail: err instanceof Error ? err.message.slice(0, 160) : "desconhecido",
+        });
+      }
+    }
+  } catch (err) {
+    logger.warn("pos-entrada: encerramento das demandas de quem pediu para parar falhou", {
+      organization_id: entrada.organizationId,
+      contact_id: entrada.contactId,
+      detail: err instanceof Error ? err.message.slice(0, 160) : "desconhecido",
+    });
   }
 }
 
@@ -276,12 +710,16 @@ async function aplicarOptOut(admin: Admin, entrada: EntradaDeMensagem): Promise<
  * bloqueado — por isso o passo 1 vem antes.
  */
 async function abrirDemanda(admin: Admin, entrada: EntradaDeMensagem): Promise<void> {
+  // Sem ID retornado pelo INSERT, ainda tentamos abrir a demanda pelo caminho
+  // legado. A prova CTWA exige um ID persistido e não nasce desta alternativa.
   try {
     const nascimento = await garantirLeadDaConversa(admin, {
       organizationId: entrada.organizationId,
       contactId: entrada.contactId,
       conversationId: entrada.conversationId,
+      messageId: entrada.messageId,
       nomeDoContato: entrada.nomeDoContato,
+      origem: origemDoNegocioPeloCanal(entrada.canal),
     });
 
     // Os DOIS desfechos viram log. Sem a linha do "não criou", o silêncio de
@@ -317,6 +755,29 @@ async function abrirDemanda(admin: Admin, entrada: EntradaDeMensagem): Promise<v
  */
 async function pedirDespachoDoAgente(admin: Admin, entrada: EntradaDeMensagem): Promise<void> {
   if (!entrada.messageId) return;
+
+  // Canal desativado pelo operador nunca acorda o agente: a entrega foi gravada
+  // (quarentena), mas não gera turno, fila nem gasto. Uma ida curta, antes do
+  // `emit_event` — o ponto mais barato da cadeia, comum aos canais.
+  // Falha para dentro de propósito: se a leitura falhar, despacha — as
+  // barreiras de baixo (drain, elegibilidade, turno) também leem o flag, e a
+  // ingestão nunca pode virar 500 por causa de um passo de efeito.
+  try {
+    const idsOff = await idsDosCanaisDesativados(admin, entrada.organizationId);
+    if (idsOff.includes(entrada.channelSessionId)) {
+      logger.info("pos-entrada: canal desativado — despacho pulado", {
+        organization_id: entrada.organizationId,
+        conversation_id: entrada.conversationId,
+        origem: entrada.origem,
+      });
+      return;
+    }
+  } catch (err) {
+    logger.warn("pos-entrada: leitura de canais desativados falhou — despachando", {
+      organization_id: entrada.organizationId,
+      detail: err instanceof Error ? err.message.slice(0, 120) : "unknown",
+    });
+  }
 
   const { error } = await admin.rpc("emit_event" as never, {
     p_event_type: "ai_agent.dispatch_requested",
@@ -377,8 +838,14 @@ async function guardarOrigemDaPagina(admin: Admin, entrada: EntradaDeMensagem): 
   // O ref não é lido no banco aqui: a leitura CONSOME o clique, e consumir um
   // clique fora da primeira mensagem o queimaria sem estampar ninguém.
   const ref = achada ? null : (PADRAO_DO_REF.exec(entrada.texto ?? "")?.[1] ?? null);
-  // O caso comum: quase nenhuma mensagem traz código de página nem ref.
-  if (!achada && !ref) return;
+  // O caso comum: quase nenhuma mensagem traz código de página nem ref. Sem
+  // código, ainda pode ser quem clicou num link rastreável e APAGOU o código ao
+  // editar a mensagem — a origem sai do horário do clique, e o caso sem clique
+  // pendente custa uma consulta (ver `lib/leads/origem-por-horario.ts`).
+  if (!achada && !ref) {
+    await casarOrigemPorHorario(admin, entrada);
+    return;
+  }
 
   try {
     // A consulta vem ANTES de qualquer escrita, e DENTRO do try: falha de
