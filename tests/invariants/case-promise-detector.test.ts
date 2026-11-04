@@ -125,3 +125,40 @@ describe("detectHumanPromise — extraHumanNames (nome próprio do tenant)", () 
     expect(detectHumanPromise("o Fulano é o nosso gerente de oficina", HANDOFF_KEYWORDS)).toBe(false);
   });
 });
+
+
+describe("consentimento para transferência não é operação executada", () => {
+  it.each([
+    "Você quer que eu te transfira para a equipe verificar?",
+    "Posso falar com o responsável para você?",
+    "Gostaria de ser encaminhado para o setor?",
+    "Quer que eu verifique com a equipe?",
+  ])("não exige caso antes de aceitar: %s", (body) => {
+    expect(detectHumanPromise(body)).toBe(false);
+  });
+  // #3725 — uma abertura antes da pergunta ("Entendi!", a reação ao "Não" do cliente)
+  // derrubava a isenção. Agora UMA abertura de reconhecimento sem conteúdo, de lista
+  // FECHADA, é tolerada; qualquer outra frase devolve a análise à mensagem inteira:
+  it.each([
+    "Entendi! Quer que eu encaminhe para a equipe verificar?",
+    "Certo! Quer que eu fale com o responsável sobre isso?",
+    "Ok! Quer que eu chame alguém do time para te ajudar?",
+  ])("abertura + pergunta de consentimento segue sem exigir caso: %s", (body) => {
+    expect(detectHumanPromise(body)).toBe(false);
+  });
+  it.each([
+    "Já transferi para a equipe. Você quer continuar?",
+    "Vou encaminhar para o setor. Você quer?",
+    "Quer que eu te transfira? Nossa equipe vai retornar hoje.",
+    "Você quer falar com a equipe que já acabei de chamar?",
+  ])("conserva promessa independente: %s", (body) => {
+    expect(detectHumanPromise(body)).toBe(true);
+  });
+  it("o que sobra fora a pergunta continua sendo analisado (#3725)", () => {
+    expect(detectHumanPromise("Já acionei o time. Quer que eu encaminhe para a equipe?")).toBe(true);
+    expect(detectHumanPromise("Entendi! Já encaminhei para a equipe, tudo bem?")).toBe(true);
+    // Abertura fora da lista ("Vou anotar aqui.") não é isenta: falha fechada.
+    expect(detectHumanPromise("Entendi! Vou anotar aqui. Quer que eu encaminhe para a equipe?")).toBe(true);
+    expect(detectHumanPromise("Pode deixar. Quer que eu chame o responsável?")).toBe(true);
+  });
+});

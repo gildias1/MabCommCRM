@@ -3,18 +3,20 @@ import Link from "next/link";
 import { useT } from "@/hooks/i18n/useT";
 import { usePathname } from "next/navigation";
 import { useEffect, useState, useTransition } from "react";
-import { ArrowRight, CaretDoubleLeft, CaretDoubleRight, CaretDown, Gear } from "@/lib/ui/icons";
+import { ArrowRight, BookOpen, CaretDoubleLeft, CaretDoubleRight, CaretDown, Gear } from "@/lib/ui/icons";
 import { cn } from "@/lib/utils";
 import { toggleSidebar } from "@/app/actions/shell/toggleSidebar";
 import { useAuth } from "@/hooks/auth/AuthProvider";
 import { ConnectionHealthDot } from "@/components/connections/ConnectionHealthDot";
 import { ContadorDeCasos } from "@/components/shell/ContadorDeCasos";
 import { ContadorDaFila } from "@/components/shell/ContadorDaFila";
+import { ContadorDeTarefas } from "@/components/shell/ContadorDeTarefas";
 import { VersionFooter } from "@/components/shell/VersionFooter";
 import { LogotipoDoProduto, SimboloDoProduto } from "@/components/branding/MarcaDoProduto";
 import { marcaEhADoProduto } from "@/lib/branding";
 import { useMarcaDaInstalacao } from "@/lib/branding/contexto";
 import { GRUPO_NO_RODAPE, sidebarGroups } from "@/lib/navigation/registry";
+import { usePrefetchPorIntencao } from "@/hooks/navigation/prefetchPorIntencao";
 
 const CHAVE_GRUPOS_FECHADOS = "sidebar-grupos-fechados";
 
@@ -43,6 +45,13 @@ export function SidebarContent({
   const pathname = usePathname();
   const [isPending, startTransition] = useTransition();
   const { user, activeOrg } = useAuth();
+  /**
+   * O menu não prefetcha sozinho (#3170): um render RSC por link do menu (19
+   * destinos × as duas instâncias, lateral e móvel), e eles disputam o servidor
+   * com o render que o clique pediu. O prefetch passa a ser
+   * por intenção (ponteiro/foco) — ver `hooks/navigation/prefetchPorIntencao.ts`.
+   */
+  const intencao = usePrefetchPorIntencao();
   const todos = sidebarGroups(
     user.is_platform_admin && !user.support,
     activeOrg?.role ?? null,
@@ -53,7 +62,21 @@ export function SidebarContent({
   // Configurações sai da área que rola e vai para o rodapé fixo: medido em
   // 1280x768, ele caía fora da dobra mesmo em telas de 1080px.
   const grupos = todos.filter((g) => g.group.id !== GRUPO_NO_RODAPE);
-  const rodape = todos.find((g) => g.group.id === GRUPO_NO_RODAPE)?.group.hub;
+  const grupoDoRodape = todos.find((g) => g.group.id === GRUPO_NO_RODAPE);
+  const rodape = grupoDoRodape?.group.hub;
+  /**
+   * "Ajuda" é o ÚLTIMO item do rodapé fixo (issue #3567), e chega por `href` em
+   * vez de uma segunda lista escrita aqui: a entrada vive no `NAV_CATALOG` com
+   * `sidebar: true`, então atravessa o mesmo filtro de papel, de módulo e de
+   * área personalizada que todo o resto do menu. Um `Link` de Ajuda escrito à
+   * mão aqui faria o link sobreviver a uma empresa que tirou a tela das áreas
+   * dela — e a pessoa cairia num 403 saindo do socorro.
+   *
+   * O comentário NÃO pode citar a tag com os sinais: a cerca
+   * `menu-prefetch-so-por-intencao` lê o TEXTO do arquivo, comentário incluído,
+   * e uma tag de exemplo aqui é indistinguível de um link de verdade para ela.
+   */
+  const ajuda = grupoDoRodape?.items.find((d) => d.href === "/app/ajuda");
 
   /**
    * Grupo fechado é preferência POR NAVEGADOR, não por conta: começa vazio (tudo
@@ -137,7 +160,10 @@ export function SidebarContent({
           // Sem arte própria para o escuro, preserva a proteção de contraste.
           <div
             className={cn(
-              "rounded-md",
+              // `min-w-0`: item de flex não encolhe abaixo do `min-width: auto`,
+              // que é o valor padrão — sem isso, uma arte própria larga empurra o
+              // botão de recolher para fora da barra em vez de encolher.
+              "min-w-0 rounded-md",
               !logoEscuro && "dark:bg-white dark:px-2 dark:py-1 dark:shadow-sm",
             )}
           >
@@ -152,19 +178,36 @@ export function SidebarContent({
                 src={logo}
                 alt={nome}
                 className={cn(
-                  "h-7 w-auto max-w-[10rem] object-contain",
+                  // `max-w-[min(10rem,100%)]` e não `max-w-[10rem]` sozinho, como o
+                  // review mediu (#2723): a linha da logo tem ~207px úteis na barra
+                  // aberta e o botão de recolher disputa o mesmo espaço. Uma arte
+                  // própria larga (160px) vazava 7px do fundo claro e ficava a 1px
+                  // do botão. O teto de 10rem continua valendo, mas agora a imagem
+                  // encolhe antes de estourar.
+                  //
+                  // `max-w-[10rem]` + `max-w-full` não valem os dois: disputam a
+                  // MESMA propriedade no CSS e só um sobrevive — a pegadinha que o
+                  // review apontou, e por isso o teto é um único `min()`.
+                  "h-7 w-auto max-w-[min(10rem,100%)] object-contain",
                   logoEscuro && "dark:hidden",
                 )}
               />
             ) : (
-              <span className="dark:hidden">{nome}</span>
+              // `truncate` + `title`: o nome longo (uma clínica com nome grande,
+              // medido no review) virava 3 linhas dentro de uma linha de 56px e
+              // estourava a barra. Uma linha com reticências, e o nome completo
+              // continua no tooltip. `block` porque este wrapper não é flex: inline,
+              // o `truncate` não corta e o nome passa por cima do botão.
+              <span className="block min-w-0 truncate dark:hidden" title={nome}>
+                {nome}
+              </span>
             )}
             {logoEscuro ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={logoEscuro}
                 alt={nome}
-                className="hidden h-7 w-auto max-w-[10rem] object-contain dark:block"
+                className="hidden h-7 w-auto max-w-[min(10rem,100%)] object-contain dark:block"
               />
             ) : null}
           </div>
@@ -177,7 +220,15 @@ export function SidebarContent({
             <LogotipoDoProduto nome={nome} className="h-8 w-auto" />
           )
         ) : (
-          <span className={cn("font-semibold tracking-tight", collapsed && "sr-only")}>{nome}</span>
+          <span
+            className={cn(
+              "min-w-0 truncate font-semibold tracking-tight",
+              collapsed && "sr-only",
+            )}
+            title={nome}
+          >
+            {nome}
+          </span>
         )}
         {collapsed && !marcaDoProduto && (
           <span aria-hidden className="text-lg font-bold text-primary">
@@ -188,7 +239,32 @@ export function SidebarContent({
             {[...nome][0]?.toUpperCase() ?? brand.initial}
           </span>
         )}
+        {/* Issue #2722 — o controle de recolher mora no ALTO, como no
+            mercado: na linha da logo, à direita, quando a barra está aberta. */}
+        {showCollapseControl && !collapsed && (
+          // `shrink-0`: sem isso o botão é o primeiro a ser espremido quando a
+          // marca é larga — e ele é o controle, não sobra.
+          <div className="ml-auto shrink-0 pl-2">
+            <BotaoDeRecolher
+              collapsed={false}
+              isPending={isPending}
+              soIcone
+              onClick={() => startTransition(() => toggleSidebar(collapsed))}
+            />
+          </div>
+        )}
       </div>
+      {/* Issue #2722 — no trilho recolhido (64px) não cabe controle ao lado
+          do símbolo: ele vira uma faixa imediatamente abaixo da marca. */}
+      {showCollapseControl && collapsed && (
+        <div className="border-b px-2 py-1">
+          <BotaoDeRecolher
+            collapsed
+            isPending={isPending}
+            onClick={() => startTransition(() => toggleSidebar(collapsed))}
+          />
+        </div>
+      )}
       {/*
         A DENSIDADE É MEDIDA, NÃO ESTÉTICA.
 
@@ -233,8 +309,20 @@ export function SidebarContent({
         mais densidade raspada. A conta é fechada e vale conferir antes de abrir
         o PR: cada linha custa 32px (28px de altura + 4px de `space-y-1`), e
         trocar N destinos do menu por um único link de hub devolve (N-1)×32px.
+        ✅ O RODAPÉ TAMBÉM PESA — e ele não tem hub. O link da Ajuda (#3567) entrou
+        na coluna fixa embaixo: uma linha de 32px (28px de item + `mb-1`) que sai
+        direto da altura desta nav. Medido em 1280×900, o conteúdo daqui NÃO mudou
+        — 744px —, mas a caixa visível caiu de 763 para 731 e o `navegacao.spec.ts`
+        reprovou por 13px. Os 16px devolvidos vieram da MOLDURA, não de item:
+        4px no topo/rodapé desta nav (`p-2` → `px-2 py-1`), 4px no rodapé fixo e
+        2px entre os dois links fixos (`mb-1` → `mb-0.5`). Os `py-1`/`text-sm` de
+        cada destino continuam os mesmos: a regra do hub vale para destino novo,
+        e nenhum destino novo apareceu aqui.
       */}
-      <nav className="flex-1 space-y-2 overflow-y-auto p-2" aria-label={t("Navegação principal")}>
+      <nav
+        className="flex-1 space-y-2 overflow-y-auto px-2 py-1"
+        aria-label={t("Navegação principal")}
+      >
         {grupos.map(({ group, items }) => {
           const tituloId = `nav-grupo-${group.id}`;
           // Recolhido o sidebar inteiro (rail de 64px), o grupo sempre mostra
@@ -280,6 +368,7 @@ export function SidebarContent({
                       <li key={item.href}>
                         <Link
                           href={item.href}
+                          {...intencao(item.href)}
                           title={collapsed ? t(item.label) : undefined}
                           aria-current={isActive ? "page" : undefined}
                           onClick={onNavigate}
@@ -300,6 +389,9 @@ export function SidebarContent({
                           )}
                           {item.contador === "casos" && <ContadorDeCasos compacto={collapsed} />}
                           {item.contador === "fila" && <ContadorDaFila compacto={collapsed} />}
+                          {item.contador === "tarefas" && (
+                            <ContadorDeTarefas compacto={collapsed} />
+                          )}
                         </Link>
                       </li>
                     );
@@ -308,6 +400,7 @@ export function SidebarContent({
                     <li>
                       <Link
                         href={group.hub.href}
+                        {...intencao(group.hub.href)}
                         title={collapsed ? t(group.hub.label) : undefined}
                         aria-current={pathname === group.hub.href ? "page" : undefined}
                         onClick={onNavigate}
@@ -330,15 +423,16 @@ export function SidebarContent({
           );
         })}
       </nav>
-      <div className="border-t p-2">
+      <div className="border-t px-2 py-1">
         {rodape && (
           <Link
             href={rodape.href}
+            {...intencao(rodape.href)}
             title={collapsed ? t(rodape.label) : undefined}
             aria-current={pathname.startsWith(rodape.href) ? "page" : undefined}
             onClick={onNavigate}
             className={cn(
-              "mb-1 flex items-center gap-3 rounded-md px-3 py-1 text-sm transition-colors",
+              "mb-0.5 flex items-center gap-3 rounded-md px-3 py-1 text-sm transition-colors",
               pathname.startsWith(rodape.href)
                 ? "bg-accent text-accent-foreground"
                 : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
@@ -349,28 +443,83 @@ export function SidebarContent({
             {!collapsed && <span className="truncate">{t(rodape.label)}</span>}
           </Link>
         )}
-        <VersionFooter collapsed={collapsed} onNavigate={onNavigate} />
-        {showCollapseControl && (
-          <button
-            type="button"
-            onClick={() => startTransition(() => toggleSidebar(collapsed))}
-            disabled={isPending}
+        {ajuda && (
+          // Último link do rodapé, como pedido na issue #3567: é o que se
+          // procura quando o resto não respondeu. Mesmas classes do link de
+          // Configurações acima — rodapé com dois pesos diferentes lê-se como
+          // dois assuntos diferentes.
+          <Link
+            href={ajuda.href}
+            {...intencao(ajuda.href)}
+            title={collapsed ? t(ajuda.label) : undefined}
+            aria-current={pathname.startsWith(ajuda.href) ? "page" : undefined}
+            onClick={onNavigate}
             className={cn(
-              "flex w-full items-center gap-2 rounded-md px-3 py-2 text-xs text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+              "mb-0.5 flex items-center gap-3 rounded-md px-3 py-1 text-sm transition-colors",
+              pathname.startsWith(ajuda.href)
+                ? "bg-accent text-accent-foreground"
+                : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
               collapsed && "justify-center px-2",
             )}
-            aria-label={collapsed ? t("Expandir sidebar") : t("Recolher sidebar")}
           >
-            {collapsed ? (
-              <CaretDoubleRight size={14} aria-hidden />
-            ) : (
-              <CaretDoubleLeft size={14} aria-hidden />
-            )}
-            {!collapsed && <span>{t("Recolher")}</span>}
-          </button>
+            <BookOpen size={18} aria-hidden />
+            {!collapsed && <span className="truncate">{t(ajuda.label)}</span>}
+          </Link>
         )}
+        <VersionFooter collapsed={collapsed} onNavigate={onNavigate} />
       </div>
     </>
+  );
+}
+
+/**
+ * Issue #2722 — o MESMO controle de antes (classes, `toggleSidebar` via
+ * `startTransition`, `isPending`, `aria-label` Recolher/Expandir), só que no
+ * ALTO: na linha da logo quando aberta (padrão de mercado), e numa faixa sob
+ * o símbolo quando recolhida — os 64px do trilho não comportam botão ao lado
+ * da marca sem espremer.
+ */
+function BotaoDeRecolher({
+  collapsed,
+  isPending,
+  onClick,
+  soIcone = false,
+}: {
+  collapsed: boolean;
+  isPending: boolean;
+  onClick: () => void;
+  /**
+   * Barra aberta, sem o rótulo. O review mediu (#2723) que o rótulo custa
+   * ~54px de uma linha com ~207px úteis, e uma logo-palavra de 5:1 (140px)
+   * já estourava por causa disso. Só o ícone devolve ~161px para a marca.
+   *
+   * Acessibilidade não muda: o `aria-label` é o mesmo ("Recolher sidebar"),
+   * e o `title` cobre o hover para quem só enxerga o desenho.
+   */
+  soIcone?: boolean;
+}) {
+  const t = useT();
+  // Um rótulo só para `aria-label` e `title`: os dois nomeiam a MESMA ação.
+  const rotulo = collapsed ? t("Expandir sidebar") : t("Recolher sidebar");
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={isPending}
+      className={cn(
+        "flex w-full items-center gap-2 rounded-md px-3 py-2 text-xs text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+        (collapsed || soIcone) && "justify-center px-2",
+      )}
+      aria-label={rotulo}
+      title={collapsed || soIcone ? rotulo : undefined}
+    >
+      {collapsed ? (
+        <CaretDoubleRight size={14} aria-hidden />
+      ) : (
+        <CaretDoubleLeft size={14} aria-hidden />
+      )}
+      {!collapsed && !soIcone && <span>{t("Recolher")}</span>}
+    </button>
   );
 }
 
@@ -391,13 +540,29 @@ export function Sidebar({ collapsed }: { collapsed: boolean }) {
         // que é a assinatura de servidor e navegador terem pintado estados
         // diferentes — e `AppShell` e `Sidebar` são ambos `"use client"`.
         //
-        // `sticky top-0 h-screen` dá o mesmo efeito visual (a barra não rola com
+        // `sticky top-0 h-dvh` dá o mesmo efeito visual (a barra não rola com
         // a página) e ela VOLTA a ocupar lugar: sobra para o conteúdo exatamente
         // o que ela não usou, e não há segunda medida para discordar.
         //
+        // `h-dvh` e não `h-screen`: `100vh` é a janela com a barra de endereço
+        // RECOLHIDA, e o navegador nunca corrige esse valor. No tablet entre 768
+        // e 1023px — onde esta barra JÁ aparece, porque a casca a mostra a partir
+        // de `md` — a barra media mais que a janela e o fim dela ficava fora do
+        // alcance. `dvh` acompanha a barra do navegador aparecendo e sumindo.
+        // Princípio 2 de `docs/design-system/screen-flow/07-responsive-strategy.md`.
+        //
+        // O topo e a altura descontam `--faixas-de-cima` (`FaixasDeCima`): as
+        // faixas grudam em `top-0` com z-50, e uma barra em `top-0` passaria
+        // por baixo delas ao rolar — e com `h-dvh` cheio o documento mediria a
+        // tela mais a faixa.
+        //
         // `shrink-0` porque item de flex encolhe por padrão, e uma barra de 60
         // espremida para caber é o mesmo defeito por outro caminho.
-        "sticky top-0 z-30 flex h-screen shrink-0 flex-col border-r bg-card transition-[width] duration-200",
+        //
+        // `duration-base` em vez do `duration-200` literal: 200ms é o mesmo
+        // número, mas vindo de `--duration-base`. A Lei de movimento fecha a
+        // tabela de durações, e número solto é o que a faz apodrecer.
+        "sticky top-[var(--faixas-de-cima,0px)] z-30 flex h-[calc(100dvh-var(--faixas-de-cima,0px))] shrink-0 flex-col border-r bg-card transition-[width] duration-base",
         collapsed ? "w-16" : "w-60",
       )}
     >

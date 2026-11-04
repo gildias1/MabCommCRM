@@ -36,6 +36,7 @@ import type { NextRequest } from "next/server";
 import { z } from "zod";
 
 import { assertWahaConnectionIdle, ChannelConnectionError, renomearSessaoParaOTeto } from "@/lib/channels/connect-waha";
+import { lerGuardarHistorico } from "@/lib/channels/acervo-do-historico";
 import { nomeDaSessaoCabeNoWaha, podeRenomearSessaoDoWaha } from "@/lib/channels/nome-da-sessao";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { sincronizarRecebimentoDeGrupos } from "@/lib/grupos/sincronizar-filtro";
@@ -47,6 +48,7 @@ import { ARCHIVED_AT, queryTolerantToMissingArchived } from "@/lib/channels/arch
 import { createClient } from "@/lib/supabase/server";
 import { getWahaClient, wahaFriendlyError } from "@/lib/waha/client";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { traduzirLimiteDoPlano } from "@/lib/cobranca/limites";
 
 export const dynamic = "force-dynamic";
 
@@ -93,8 +95,8 @@ export async function POST(
   // arquivado, e exigir a coluna aqui derrubaria a reconexão inteira — que é o
   // socorro de quem está com o número fora do ar.
   const { data: sessionRaw } = await queryTolerantToMissingArchived(
-    () => buscar(`id, waha_session_name, status, phone_number, ${ARCHIVED_AT}`),
-    () => buscar("id, waha_session_name, status, phone_number"),
+    () => buscar(`id, waha_session_name, status, phone_number, metadata, ${ARCHIVED_AT}`),
+    () => buscar("id, waha_session_name, status, phone_number, metadata"),
   );
   const session = sessionRaw as {
     id: string;
@@ -102,6 +104,7 @@ export async function POST(
     status?: string | null;
     phone_number?: string | null;
     archived_at?: string | null;
+    metadata?: Record<string, unknown> | null;
   } | null;
   if (!session) return fail("not_found", t("Canal não encontrado."), 404, { requestId });
   if (session.archived_at) {
@@ -167,11 +170,27 @@ export async function POST(
 
   try {
     await assertWahaConnectionIdle(createAdminClient(), activeOrg.orgId, id);
+    // A linha morta e sem número não ocupa vaga do plano (0809); revivê-la volta
+    // a ocupar. A vaga é conferida e tomada no banco (9036) ANTES de tocar o
+    // transporte — número já pareado passa direto, mesmo acima do teto.
+    const vaga = await createAdminClient().rpc("fn_vaga_ao_reviver_canal", { p_org: activeOrg.orgId, p_canal: id });
+    if (vaga.error) {
+      const limite = traduzirLimiteDoPlano(vaga.error, authz.user.idioma);
+      if (limite) return fail(limite.code, limite.message, 409, { requestId, details: limite.details });
+      return fail("internal_error", t("Não foi possível concluir a conexão. Tente novamente."), 500, { requestId });
+    }
     await waha.stopSession(nomeParaOTransporte);
     // Só no modo forçado: descartar a credencial é irreversível — obriga a
     // reescanear o QR mesmo que ela ainda estivesse boa.
     if (force) await waha.logoutSession(nomeParaOTransporte);
-    const remote = (await waha.startSession(nomeParaOTransporte)) as { status?: string };
+    // Com a opção de acervo ligada nesta conexão, o start também converge o
+    // store (num número já pareado, guarda daqui em diante). Desligada, a
+    // chamada é a de sempre, sem segundo argumento — e o store fica como o
+    // canal o tem: só o PATCH /acervo desliga.
+    const opcoesAcervo = lerGuardarHistorico(session.metadata) ? { guardarHistorico: true } : undefined;
+    const remote = (await (opcoesAcervo
+      ? waha.startSession(nomeParaOTransporte, opcoesAcervo)
+      : waha.startSession(nomeParaOTransporte))) as { status?: string };
     const nextStatus = remote.status ?? "STARTING";
     const patch = { status: nextStatus, status_reason: null, last_status_change_at: new Date().toISOString(), consecutive_health_fails: 0 };
     const { error: syncError } = await supabase.from("channel_sessions").update(patch).eq("organization_id", activeOrg.orgId).eq("id", id);

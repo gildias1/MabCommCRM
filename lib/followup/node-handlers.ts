@@ -6,7 +6,9 @@ import type { ServiceBoundary } from "@/lib/atendimento/fronteira";
  */
 import { NO_REPLY_BRANCH_ID, REPEAT_BODY_BRANCH_ID, REPEAT_DONE_BRANCH_ID, nodeBranches } from "./graph-schema";
 import type { FlowEdge, FlowNode, ReplySaveTo } from "./graph-schema";
+import { avaliarDataRelativa, ehOpDeData, type OpDeData } from "./condicao-por-data";
 import { parseReplyCount } from "./parse-count";
+import { janelaDaEspera, primeiroInstanteNoHorario } from "./espera-no-horario";
 import { clampEspera, esperaPlanejadaDe, type EsperaAdaptativa } from "./timing-plan";
 import { fraseDeConfirmacao } from "./vocabulario";
 
@@ -23,6 +25,14 @@ export type EnrollmentStatus =
    */
   | "dormente"
   | "paused_handoff"
+  /**
+   * Pausa pedida por uma pessoa (0145, `STATUS_PAUSA_MANUAL` em `intervencao.ts`).
+   * Sem relógio e fora de `LIVE_STATUSES`: a mensagem comum não a acorda — quem a
+   * retoma é quem pausou. O opt-out a alcança (`reactivity.ts`). Faltava neste
+   * tipo desde a 0145, e foi por isso que a lista do opt-out pôde esquecê-la sem
+   * o compilador ter como apontar.
+   */
+  | "paused_manual"
   /**
    * Roteiro de atendimento em andamento (0394). Conduzido pelo TURNO, não pelo
    * relógio: o motor de follow-up nunca o reclama (o claim filtra
@@ -76,6 +86,13 @@ export interface EnrollmentRow {
 
 /** Minimal typed facts a `condition` node can check — loaded by the engine, never guessed. */
 export interface LeadFacts {
+  /**
+   * Fuso da ORGANIZAÇÃO, para a condição por data comparar dia de calendário —
+   * ver `condicao-por-data.ts` — e para a espera com horário (`ate_o_horario`,
+   * `espera-no-horario.ts`). Ausente cai no padrão do produto; o motor só o
+   * resolve quando o grafo tem regra de data ou espera com horário.
+   */
+  fuso?: string | null;
   lead_stage: string | null;
   tags: string[];
   steps_taken: number;
@@ -227,10 +244,30 @@ export function rechecksOciososDaAcao(events: EnrollmentEventRef[], nodeId: stri
   for (let i = events.length - 1; i >= 0; i--) {
     const evento = events[i]!;
     if (evento.node_id !== nodeId) break;
-    if (evento.event_type === EVENTO_ACAO_ADIADA) return n;
+    if (evento.event_type === EVENTO_ACAO_ADIADA || evento.event_type === EVENTO_TURNO_DESCARTADO) return n;
     n++;
   }
   return n;
+}
+
+/**
+ * O turno de envio desta estadia saiu da fila SEM rodar: a organização foi
+ * suspensa e `fn_org_parada_descarta_fila` (migration 0501) o falhou, gravando
+ * este evento. Não é defeito do worker, então não conta para o dead-man (ver
+ * `rechecksOciososDaAcao`), e o motor enfileira um turno novo na reativação —
+ * o claim não entrega a inscrição enquanto a org está parada.
+ */
+export const EVENTO_TURNO_DESCARTADO = "turn_discarded";
+
+/** O último turno desta estadia no `action` foi descartado e nenhum outro o substituiu. */
+export function turnoDaAcaoDescartado(events: EnrollmentEventRef[], nodeId: string): boolean {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const evento = events[i]!;
+    if (evento.node_id !== nodeId) return false;
+    if (evento.event_type === EVENTO_TURNO_DESCARTADO) return true;
+    if (evento.event_type === "turn_enqueued") return false;
+  }
+  return false;
 }
 
 /**
@@ -442,9 +479,32 @@ export function ultimoDesfechoDe(events: EnrollmentEventRef[]): string | null {
 }
 
 function evaluateCheck(
-  check: { field: "lead_stage" | "tag" | "steps_taken" | "last_outcome"; op: "eq" | "neq" | "gte" | "lte" | "contains"; value: string | number },
+  check: {
+    field: "lead_stage" | "tag" | "steps_taken" | "last_outcome" | "lead_date";
+    op: "eq" | "neq" | "gte" | "lte" | "contains" | OpDeData;
+    value: string | number;
+    key?: string;
+  },
   lead: LeadFacts,
+  agora: Date,
 ): boolean {
+  // A regra de data sai ANTES de tudo: ela não tem valor "atual" comparável
+  // pelos operadores comuns, e `custom_fields` é jsonb — qualquer coisa pode
+  // estar lá. Campo ausente ou ilegível responde `false`, nunca `true`.
+  if (check.field === "lead_date") {
+    if (!ehOpDeData(check.op) || !check.key) return false;
+    return avaliarDataRelativa({
+      valor: lead.custom_fields?.[check.key],
+      op: check.op,
+      dias: check.value,
+      agora,
+      fuso: lead.fuso,
+    });
+  }
+  // Operador de data em campo que não é de data: o schema recusa no publish, e
+  // aqui responde `false` em vez de cair num `switch` que não o conhece.
+  if (ehOpDeData(check.op)) return false;
+
   const actual: string | number | null | string[] =
     check.field === "lead_stage" ? lead.lead_stage
     : check.field === "tag" ? lead.tags
@@ -487,11 +547,18 @@ function evaluateCheck(
   }
 }
 
-function evaluateCondition(
+/**
+ * Exportada para a revalidação imediatamente antes do envio
+ * (`condicao-antes-do-envio.ts`): a mesma função, nunca uma segunda régua —
+ * duas avaliações da mesma condição que pudessem divergir seriam pior que
+ * nenhuma revalidação.
+ */
+export function evaluateCondition(
   config: Extract<FlowNode, { type: "condition" }>["config"],
   lead: LeadFacts,
+  agora: Date,
 ): boolean {
-  const results = config.checks.map((check) => evaluateCheck(check, lead));
+  const results = config.checks.map((check) => evaluateCheck(check, lead, agora));
   return config.combinator === "and" ? results.every(Boolean) : results.some(Boolean);
 }
 
@@ -593,12 +660,16 @@ export function processNode(input: {
 
     case "wait": {
       // Resposta do lead corta a espera: o timer é teto (ninguém respondeu),
-      // não um atraso obrigatório depois de cada envio.
+      // não um atraso obrigatório depois de cada envio. Vale também com horário
+      // (`ate_o_horario`): ele segura o toque PROATIVO, não a resposta a quem
+      // acabou de escrever.
       if (wokeEarly) {
         const edge = selectEdge(edges, node.id, { type: "always" });
         if (!edge) return { kind: "fail", error: `wait node "${node.id}" has no outbound edge after elapsing` };
         return { kind: "advance", next_node_id: edge.target, next_eval_at: clock() };
       }
+      const janelaDoNo =
+        node.config.mode === "fixed" ? janelaDaEspera(node.config.ate_o_horario, lead.fuso) : null;
       if (!waitElapsed) {
         // Adaptativo: o instante vem do plano decidido no acionamento. Sem plano
         // legível para ESTE nó (enrollment anterior à feature, fluxo v1, jsonb
@@ -622,11 +693,24 @@ export function processNode(input: {
         // slot único anti-spam enquanto ela espera. Quem a acorda continua sendo
         // o `next_eval_at` abaixo, pelo mesmo claim — não há segundo agendador.
         const imune = node.config.mode === "fixed" && node.config.immune_to_reply === true;
+        // Horário da espera (`ate_o_horario`): o fim que cai de noite ou num dia
+        // fechado vai para a próxima abertura JÁ AQUI, na entrada — a fila mostra
+        // o instante verdadeiro do próximo passo, não as 24 h cruas.
         return {
           kind: "wait",
-          next_eval_at: new Date(clock().getTime() + durationMs),
+          next_eval_at: primeiroInstanteNoHorario(new Date(clock().getTime() + durationMs), janelaDoNo),
           ...(imune ? { wake_status: "dormente" as const } : {}),
         };
+      }
+      // E é conferido de novo na SAÍDA. O fim calculado na entrada não é a única
+      // origem do relógio: retomar uma pausa devolve o restante, e adiar grava a
+      // hora que a pessoa escolheu — os dois podem cair fora do horário. Fora
+      // dele, a espera continua até a abertura (custa um tick, como um recheck).
+      const agora = clock();
+      const abertura = primeiroInstanteNoHorario(agora, janelaDoNo);
+      if (abertura.getTime() > agora.getTime()) {
+        const imune = node.config.mode === "fixed" && node.config.immune_to_reply === true;
+        return { kind: "wait", next_eval_at: abertura, ...(imune ? { wake_status: "dormente" as const } : {}) };
       }
       const edge = selectEdge(edges, node.id, { type: "always" });
       if (!edge) return { kind: "fail", error: `wait node "${node.id}" has no outbound edge after elapsing` };
@@ -639,7 +723,7 @@ export function processNode(input: {
         // lista é a precedência — a mesma ordem que o usuário vê no formulário.
         // Duas regras verdadeiras não podem sortear caminho; `combinator` não
         // é consultado aqui, porque nesse modo a regra não vota, ela roteia.
-        const hitId = node.config.checks.find((c) => c.id !== undefined && evaluateCheck(c, lead))?.id;
+        const hitId = node.config.checks.find((c) => c.id !== undefined && evaluateCheck(c, lead, clock()))?.id;
         // Nenhuma regra passou -> o ramo obrigatório 'else', que na aresta é `always`.
         // `selectEdge` também cai nele quando o usuário deixou um ramo sem ligar:
         // sair pela saída de escape é ruim, ficar preso no nó é pior.
@@ -655,7 +739,7 @@ export function processNode(input: {
         }
         return { kind: "advance", next_node_id: edge.target, next_eval_at: clock() };
       }
-      const result = evaluateCondition(node.config, lead);
+      const result = evaluateCondition(node.config, lead, clock());
       const edge = selectEdge(edges, node.id, { type: "cond_result", value: result });
       if (!edge) return { kind: "fail", error: `condition node "${node.id}" has no matching edge for result ${result}` };
       return { kind: "advance", next_node_id: edge.target, next_eval_at: clock() };
@@ -860,6 +944,27 @@ export function processNode(input: {
       // para sair.
       const edge = selectEdge(edges, node.id, { type: "always" });
       if (!edge) return { kind: "fail", error: `internal_task node "${node.id}" has no outbound edge` };
+      return { kind: "advance", next_node_id: edge.target, next_eval_at: clock() };
+    }
+
+    case "move_lead": {
+      // #2065 — mover o card de etapa é PASSAGEM no relógio, como o
+      // `internal_task`: o nó avança pela aresta única e quem ESCREVE a etapa é
+      // o motor ao aplicar o `advance` (`db.moverLeadNoFunil`, que chama o
+      // `moveLeadHandler` da casa com o `lost_reason` do bloco, sem padrão
+      // escondido), guardado pelo idempotency_key do evento do
+      // passo — replay do tick não move o card duas vezes.
+      const edge = selectEdge(edges, node.id, { type: "always" });
+      if (!edge) return { kind: "fail", error: `move_lead node "${node.id}" has no outbound edge` };
+      return { kind: "advance", next_node_id: edge.target, next_eval_at: clock() };
+    }
+
+    case "edit_lead_tag": {
+      // #2065 — mesma passagem do `move_lead`: a tag nasce no motor, depois do
+      // evento do passo, com a MESMA trava. Nenhuma mensagem sai daqui (por isso
+      // este nó não está em `NOS_QUE_ENVIAM`).
+      const edge = selectEdge(edges, node.id, { type: "always" });
+      if (!edge) return { kind: "fail", error: `edit_lead_tag node "${node.id}" has no outbound edge` };
       return { kind: "advance", next_node_id: edge.target, next_eval_at: clock() };
     }
 

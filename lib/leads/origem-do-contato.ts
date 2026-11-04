@@ -30,6 +30,13 @@
  * vai procurar um defeito que não há.
  */
 
+/**
+ * `contacts.source` de quem entrou pelo "Sincronizar agenda do celular" (#2736).
+ * Mora aqui, e não no serviço da agenda, porque a ficha e o filtro de origem
+ * (telas de cliente) também a leem, e aquele módulo é de servidor.
+ */
+export const ORIGEM_AGENDA_DO_CELULAR = "whatsapp_agenda";
+
 /** As chaves que respondem "de onde veio", antes de cair na coluna `source`. */
 const CHAVES_DA_ORIGEM = ["utm_source", "ad_platform"] as const;
 
@@ -56,6 +63,12 @@ export interface OrigemDoContato {
    * posicionamento chegou pela URL (não há ausência para explicar).
    */
   semPosicionamentoDeAnuncio: boolean;
+  /**
+   * A origem foi DEDUZIDA pelo horário de um clique, não lida de um código no
+   * texto: o cliente apagou o código ao editar a mensagem
+   * (`lib/leads/origem-por-horario.ts`). A ficha avisa, porque é inferência.
+   */
+  inferidaPorHorario: boolean;
 }
 
 /** Texto não vazio, ou `null`. Número e booleano no jsonb não são rótulo. */
@@ -95,5 +108,6 @@ export function origemDoContato(
     anuncio: primeiro(meta, ["utm_ad", "ad_name", "ad_title"]),
     posicionamento,
     semPosicionamentoDeAnuncio: deAnuncio && posicionamento === null,
+    inferidaPorHorario: meta.origem_inferida_por === "horario",
   };
 }

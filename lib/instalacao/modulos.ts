@@ -36,12 +36,13 @@
  * só se isto aparecer medido num perfil.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
+import type pg from "pg";
 
 import { logger } from "@/lib/logger";
 
 /**
- * `banco_externo`, `fluxos_atendimento`, `propostas` e `crm_b2b` ligam/desligam por uma linha em `platform_config`
- * (ver o resto deste arquivo). `honorarios` é um MÓDULO DE TABELA (ADR-0002): a fonte da
+ * `banco_externo`, `fluxos_atendimento`, `propostas`, `crm_b2b`, `cobranca`, `login_codex`, `setores`, `avisos`, `conferir_whatsapp`, `mcp_por_agente` e `cold_call` ligam/desligam por uma linha em `platform_config`
+ * (ver o resto deste arquivo). `honorarios` e `financeiro` são MÓDULOS DE TABELA (ADR-0002): a fonte da
  * verdade é `modulos_instalados`, escrita só por `fn_modulo_instalar` (`lib/modulos/service.ts`),
  * nunca por esta tela. Os dois mecanismos convivem na mesma lista porque é isso que
  * `deModuloDesligado` (catálogo de tools MCP) precisa: "este módulo, seja qual for o mecanismo
@@ -53,12 +54,25 @@ export const MODULOS_OPCIONAIS = [
   "propostas",
   "crm_b2b",
   "honorarios",
+  // #1907 item 4 — a comanda nasce em `modulos_instalados` como os honorários:
+  // sem a linha `financeiro` as telas de comanda e as rotas de
+  // `app/api/v1/financeiro/comandas/*` não existem para ninguém, e a
+  // provisionadora (`fn_financeiro_provisionar`) só roda onde o módulo está
+  // instalado. `MODULOS_DE_TABELA` abaixo é o que faz `moduloLigado` enxergá-lo.
+  "financeiro",
+  "cobranca",
+  "login_codex",
+  "setores",
+  "avisos",
+  "conferir_whatsapp",
+  "mcp_por_agente",
+  "cold_call",
 ] as const;
 export type ModuloOpcional = (typeof MODULOS_OPCIONAIS)[number];
 
 /** Os módulos de tabela do ADR-0002 dentro de `MODULOS_OPCIONAIS` — resolvidos por
  * `modulos_instalados.estado = 'ativo'`, nunca por `platform_config`. */
-const MODULOS_DE_TABELA = ["honorarios"] as const satisfies readonly ModuloOpcional[];
+const MODULOS_DE_TABELA = ["honorarios", "financeiro"] as const satisfies readonly ModuloOpcional[];
 
 /**
  * Só os módulos por FLAG — os que a tela `/admin/sistema` liga e desliga via
@@ -72,6 +86,13 @@ export const MODULOS_OPCIONAIS_POR_FLAG = [
   "fluxos_atendimento",
   "propostas",
   "crm_b2b",
+  "cobranca",
+  "login_codex",
+  "setores",
+  "avisos",
+  "conferir_whatsapp",
+  "mcp_por_agente",
+  "cold_call",
 ] as const satisfies readonly ModuloOpcional[];
 
 /** A linha de cada módulo por FLAG em `platform_config`. O formato é o da CHECK da 0341.
@@ -91,6 +112,37 @@ export const CHAVE_DO_MODULO: Record<(typeof MODULOS_OPCIONAIS_POR_FLAG)[number]
   // metade B2B do #1621. A maior parte de quem usa vende para pessoas; quem
   // vende para empresas liga. Desligado, as telas e as rotas somem (404).
   crm_b2b: "MODULO_CRM_B2B",
+  // Spec da cobrança do revendedor (§1.2, D-1): capacidade do NÚCLEO com chave
+  // da instalação. As tabelas `cobranca_*` existem em todo banco, vazias; a
+  // chave decide se valem. Desligada: rotas 404, limites "sem limite", cron pula.
+  cobranca: "MODULO_COBRANCA",
+  // #1639: o login do Codex por assinatura. Desligado por padrão é a condição
+  // que o mantenedor pôs (02/10): só quem administra a instalação liga, e
+  // ligar libera o painel de conexão em /admin/sistema.
+  login_codex: "MODULO_LOGIN_CODEX",
+  // Doc 213 (A): os setores de atendimento do #3485 entram desligados. Eles
+  // organizam e filtram a Equipe e não mudam quem recebe a conversa; quem não
+  // usa não vê a aba. Desligado, a aba, a coluna e as rotas somem (404).
+  setores: "MODULO_SETORES",
+  // #1418 (fatia 1): o aviso que o admin da empresa escreve e que chega como
+  // push para a equipe. Muita instalação tem uma ou duas pessoas, e o recado
+  // para a equipe não serve a elas. Desligado, a rota responde 404.
+  avisos: "MODULO_AVISOS",
+  // #3887: a prospecção pergunta ao WhatsApp, pela conexão por QR do cliente, se
+  // cada telefone achado tem conta. É consulta em massa a partir do número do
+  // cliente, a qualquer hora e sem o aquecimento de número novo, num ritmo que
+  // ninguém mediu contra banimento. Quem aceita o risco liga; desligado, nada é
+  // consultado e a prospecção segue como antes (`lib/prospecting/whatsapp.ts`).
+  conferir_whatsapp: "MODULO_CONFERIR_WHATSAPP",
+  // Doc 252 (A): os servidores MCP POR AGENTE do #3857, com OAuth em que cada
+  // cliente autoriza a própria conta. Serve a quem vende produto conectado, não
+  // à maioria. Desligado, a seção do agente e a lista da ficha somem, as duas
+  // rotas públicas respondem 404 e o turno não monta servidor do agente.
+  mcp_por_agente: "MODULO_MCP_POR_AGENTE",
+  // #3933: a fila de ligações ativas (cold call). Discagem ativa é coisa de nicho
+  // (régua do núcleo enxuto): quem não prospecta por telefone não carrega a tela
+  // nem as rotas. Desligado, a porta some, a tela e as rotas respondem 404.
+  cold_call: "MODULO_COLD_CALL",
 };
 
 const LIGADO = "ligado";
@@ -191,6 +243,33 @@ export async function moduloLigadoComMemo(
   return ligado;
 }
 
+/**
+ * A chave da COBRANÇA com o mesmo memo, para quem só tem o pool `pg`: o gate do
+ * LLM (lib/agent-engine/edge/llm/run-model-call.ts), que roda em TODA chamada
+ * com a chave da instalação. Lê pela função que o próprio `fn_limite_do_plano`
+ * consulta. Erro = desligada: o teto do plano não roda e a chamada segue — o
+ * mesmo lado de `lerTetoDoPlano` indisponível.
+ */
+export async function cobrancaLigadaComMemo(
+  db: Pick<pg.Pool, "query">,
+  agora: number = Date.now(),
+): Promise<boolean> {
+  const memo = memoDoModulo.get("cobranca");
+  if (memo !== undefined && memo.ate > agora) return memo.ligado;
+  let ligado = false;
+  try {
+    const { rows } = await db.query<{ ligada: boolean }>("select public.fn_cobranca_ligada() as ligada");
+    ligado = rows[0]?.ligada === true;
+  } catch (erro) {
+    logger.warn("módulos da instalação: leitura da cobrança falhou — tratando como desligada", {
+      codigo: (erro as { code?: unknown } | null)?.code,
+      detalhe: erro instanceof Error ? erro.message : String(erro),
+    });
+  }
+  memoDoModulo.set("cobranca", { ligado, ate: agora + MEMO_DO_MODULO_MS });
+  return ligado;
+}
+
 /** Só para teste: esquece o memo. */
 export function esquecerMemoDosModulos(): void {
   memoDoModulo.clear();
@@ -198,10 +277,19 @@ export function esquecerMemoDosModulos(): void {
 
 /**
  * Módulos que existem no código mas ainda NÃO podem ser ligados por quem opera
- * (a capacidade chega em partes e a tela que a torna usável ainda não entrou).
- * Vazia: os roteiros de atendimento ganharam tela no PR 3 do port do #1130.
+ * (a capacidade chega em partes e o que a torna usável ainda não entrou).
+ * Vazia desde a PR 3a da cobrança do revendedor, que trouxe o provedor de
+ * pagamento. O mecanismo fica: a próxima capacidade entregue em partes o usa.
  */
 export const MODULOS_AINDA_NAO_LIGAVEIS: readonly ModuloOpcional[] = [];
+
+/**
+ * Módulos que são decisão SÓ de quem administra o servidor e não aparecem para a
+ * empresa em Configurações › Recursos opcionais. "Cobrança dos seus clientes —
+ * Desligado por quem administra o servidor" diria à empresa que ela pode pedir
+ * para ser cobrada (spec da cobrança §9).
+ */
+export const MODULOS_SO_DA_INSTALACAO: readonly ModuloOpcional[] = ["cobranca"];
 
 /**
  * Grava a escolha de quem administra a instalação. `semeado_do_env = false`

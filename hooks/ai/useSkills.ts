@@ -9,6 +9,8 @@ export interface ComparativoSkill {
   matcher_mudou: boolean;
   any_adicionadas: string[];
   any_removidas: string[];
+  tags_adicionadas: string[];
+  tags_removidas: string[];
   corpo_mudou: boolean;
   linhas_adicionadas: number;
   linhas_removidas: number;
@@ -39,6 +41,7 @@ export interface SkillsState {
 export interface SkillMatcher {
   any_keywords: string[];
   probe_keywords?: string[];
+  any_tags?: string[];
 }
 
 /** Corpo completo de uma skill instalada, para o editor. */
@@ -49,8 +52,10 @@ export interface SkillComCorpo {
   matcher: SkillMatcher;
   version_id: string;
   updated_at?: string;
-  /** Skill de pacote (.zip com arquivos): o editor avisa e não salva — o PUT devolve 409. */
+  /** Skill de pacote (.zip com arquivos): o texto é editável e o PUT herda manifesto + arquivos na versão nova (#2047). */
   tem_arquivos_do_pacote?: boolean;
+  /** Paths do manifesto (`references/` e `assets/`) — a UI mostra como somente leitura. */
+  arquivos_do_pacote?: string[];
 }
 
 export interface SalvarSkillBody {

@@ -26,11 +26,8 @@ import { fail, ok } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { LEAD_STAGES, type LeadStage } from "@/lib/agent-engine/agent/lead-state";
-import {
-  diffParaUpdates,
-  validarMapeamento,
-  type EtapaDoMapa,
-} from "@/lib/leads/agent-mapping";
+import { diffParaUpdates, validarMapeamento, type EtapaDoMapa } from "@/lib/leads/agent-mapping";
+import { anexaFluxos, carregaFluxosPorEtapa, type FluxosPorEtapa } from "@/lib/followup/fluxos-da-etapa";
 import { createClient } from "@/lib/supabase/server";
 import { traduzir } from "@/lib/i18n/dicionario";
 
@@ -90,7 +87,14 @@ const bodySchema = z.object({
  * a regra do mapeamento carregar um campo que ela nunca lê.
  */
 type EtapaComAutoria = EtapaDoMapa & {
+  /** Chance de fechamento calibrada pelo gestor, 0–100; `null` = sem calibração. */
+  win_probability?: number | null;
   avisar_na_central?: boolean | null;
+  /**
+   * Janela de "esfriando" da etapa, em horas (`crm_stages.expected_duration_hours`).
+   * `null` = a etapa não configurou e o radar usa o padrão de 24 h/72 h.
+   */
+  expected_duration_hours?: number | null;
   last_change_actor_kind: string | null;
   last_change_at: string | null;
 };
@@ -115,7 +119,7 @@ async function lerFunil(
     // consulta só para ela seria um round-trip por render numa tela de
     // configuração — e um caminho a mais para a lista e a autoria divergirem.
     .select(
-      "id, name, is_won, is_lost, win_probability, agent_stage_hint, avisar_na_central, last_change_actor_kind, last_change_at",
+      "id, name, is_won, is_lost, win_probability, agent_stage_hint, avisar_na_central, expected_duration_hours, last_change_actor_kind, last_change_at",
     )
     .eq("organization_id", orgId)
     .eq("pipeline_id", pipelineId)
@@ -141,17 +145,37 @@ function mapaDeEtapas(etapas: EtapaDoMapa[]): Record<LeadStage, string | null> {
   return mapa;
 }
 
-function corpo(etapas: EtapaComAutoria[]) {
-  return {
-    etapas: etapas.map((e) => ({
+function corpo(etapas: EtapaComAutoria[], fluxos: FluxosPorEtapa | null) {
+  // #3603 — `fluxos` é a lista read-only de «quais fluxos disparam ao entrar
+  // nesta etapa», anexada pela MESMA função que o GET das etapas usa. Ela viaja
+  // aqui porque ESTA é a leitura que a tela de etapas faz (ver `useStages`): sem
+  // isso a tela precisaria abrir uma segunda lista de etapas só para saber dos
+  // fluxos, e as duas listas divergiriam no primeiro ajuste.
+  const comFluxos = anexaFluxos(
+    etapas.map((e) => ({
       id: e.id,
       name: e.name,
       is_won: e.is_won,
       is_lost: e.is_lost,
+      // #2999: o select trazia a coluna desde bec1ab38c, mas o corpo a deixava
+      // cair — a tela de etapas lê DAQUI e mostrava a chance vazia ao recarregar.
+      win_probability: e.win_probability ?? null,
       avisar_na_central: e.avisar_na_central === true,
+      // A janela de esfriando viaja na MESMA leitura: a tela de etapas é quem
+      // a edita, e sem ela aqui o campo nasceria sempre vazio — uma edição
+      // apagaria a configuração gravada sem ninguém perceber.
+      expected_duration_hours: e.expected_duration_hours ?? null,
       last_change_actor_kind: e.last_change_actor_kind ?? null,
       last_change_at: e.last_change_at ?? null,
     })),
+    fluxos,
+  );
+
+  return {
+    // `anexaFluxos` só cria o campo quando a leitura dos fluxos respondeu:
+    // ausente é "não carregou", lista vazia é "não há nenhum". A tela trata os
+    // dois diferente, e igualá-los mentiria em um dos casos.
+    etapas: comFluxos,
     mapeamento: mapaDeEtapas(etapas),
   };
 }
@@ -168,7 +192,16 @@ export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
   try {
     const funil = await lerFunil(supabase, authz.org.orgId, pipelineId);
     if (!funil) return fail("not_found", t("Funil não encontrado."), 404, { requestId });
-    return ok(corpo(funil.etapas), { requestId });
+    // #3603 — uma consulta só para o funil inteiro (não uma por etapa). Falha
+    // aqui NÃO derruba a leitura do mapeamento: a resposta sai sem `fluxos` e a
+    // tela omite a linha em vez de afirmar «nenhum fluxo».
+    let fluxos: FluxosPorEtapa | null = null;
+    try {
+      fluxos = await carregaFluxosPorEtapa(supabase, authz.org.orgId);
+    } catch {
+      fluxos = null;
+    }
+    return ok(corpo(funil.etapas, fluxos), { requestId });
   } catch (err) {
     return fail("internal_error", (err as Error).message, 500, { requestId });
   }
@@ -285,7 +318,16 @@ export async function PUT(req: NextRequest, ctx: RouteCtx): Promise<Response> {
   try {
     const depois = await lerFunil(supabase, orgId, pipelineId);
     if (!depois) return fail("not_found", t("Funil não encontrado."), 404, { requestId });
-    return ok(corpo(depois.etapas), { requestId });
+    // #3603 — a resposta do PUT SUBSTITUI o cache da tela, então ela carrega a
+    // lista de fluxos igual ao GET: sem isso, salvar o mapeamento faria a linha
+    // dos fluxos sumir até o próximo recarregamento.
+    let fluxos: FluxosPorEtapa | null = null;
+    try {
+      fluxos = await carregaFluxosPorEtapa(supabase, orgId);
+    } catch {
+      fluxos = null;
+    }
+    return ok(corpo(depois.etapas, fluxos), { requestId });
   } catch (err) {
     return fail("internal_error", (err as Error).message, 500, { requestId });
   }

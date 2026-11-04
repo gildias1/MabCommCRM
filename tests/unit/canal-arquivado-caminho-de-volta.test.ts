@@ -27,7 +27,7 @@ import { NextRequest } from "next/server";
 import { audit } from "@/lib/audit";
 import { fail } from "@/lib/api/wrappers";
 import { requireRole } from "@/lib/auth/require-role";
-import { loadAuthUser, requireAuth, resolveActiveOrg } from "@/lib/auth/server";
+import { loadAuthUser, requireAuth, orgAtivaSemPortao } from "@/lib/auth/server";
 import type { AuthUser } from "@/lib/auth/types";
 import { CHANNEL_PROVIDER_META, CHANNEL_PROVIDER_WAHA } from "@/lib/channels/capabilities";
 import { reactivateChannelSession } from "@/lib/channels/reactivate";
@@ -38,12 +38,16 @@ import { createClient } from "@/lib/supabase/server";
 import { getWahaClient } from "@/lib/waha/client";
 import { encryptWebhookSecret } from "@/lib/webhooks/secrets";
 
-vi.mock("@/lib/auth/require-role", () => ({ requireRole: vi.fn() }));
+// `orgAtivaDaApi` REAL (sobre o `orgAtivaSemPortao` mockado): é ela que decide o 403 da org suspensa.
+vi.mock("@/lib/auth/require-role", async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  requireRole: vi.fn(),
+}));
 vi.mock("@/lib/auth/server", () => ({
   mfaEmDivida: vi.fn(async () => false),
   requireAuth: vi.fn(),
   loadAuthUser: vi.fn(),
-  resolveActiveOrg: vi.fn(),
+  orgAtivaSemPortao: vi.fn(),
 }));
 vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn() }));
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn() }));
@@ -282,10 +286,10 @@ function authOk(): void {
     idioma: "pt-BR" as const,
     organizations: [{ organization_id: ORG, organization_name: "Org", role: "admin" }],
   };
-  const org = { orgId: ORG, name: "Org", role: "admin" as const };
+  const org = { orgId: ORG, name: "Org", role: "admin" as const, org_status: "active" };
   vi.mocked(requireAuth).mockResolvedValue(user);
   vi.mocked(loadAuthUser).mockResolvedValue(user);
-  vi.mocked(resolveActiveOrg).mockResolvedValue(org);
+  vi.mocked(orgAtivaSemPortao).mockResolvedValue(org);
   vi.mocked(requireRole).mockResolvedValue({ ok: true, user, org });
 }
 
@@ -477,6 +481,30 @@ describe("POST /api/v1/channel-sessions/[id]/reconnect — canal excluído não 
     expect(waha.stopSession).toHaveBeenCalledWith(NOME_SESSAO);
     expect(waha.startSession).toHaveBeenCalledWith(NOME_SESSAO);
     expect(db.linhas[0]?.status).toBe("STARTING");
+  });
+
+  it("⭐ sem vaga no plano para reviver a linha sem número → 409 plan_limit_reached, transporte intocado (9036)", async () => {
+    authOk();
+    const db = makeDb({ sessions: [canalQr({ status: "FAILED", phone_number: null })] });
+    const cliente = vi.mocked(createAdminClient)() as unknown as {
+      rpc: (fn: string, args: Record<string, unknown>) => Promise<unknown>;
+    };
+    const rpcOriginal = cliente.rpc;
+    cliente.rpc = async (fn, args) =>
+      fn === "fn_vaga_ao_reviver_canal"
+        ? { data: null, error: { code: "PT402", message: "limite_do_plano:canais:1" } }
+        : rpcOriginal(fn, args);
+    const waha = transporteOk();
+    const { POST } = await import("@/app/api/v1/channel-sessions/[id]/reconnect/route");
+    const res = await POST(req(), ctx());
+
+    expect(res.status).toBe(409);
+    const corpo = await res.json();
+    expect(corpo.error.code).toBe("plan_limit_reached");
+    expect(corpo.error.details).toEqual({ recurso: "canais", limite: 1 });
+    expect(waha.stopSession).not.toHaveBeenCalled();
+    expect(waha.startSession).not.toHaveBeenCalled();
+    expect(db.escritas).toEqual([]);
   });
 
   it("I1: reconectar ressincroniza o filtro de grupos DEPOIS de reiniciar a sessão, na org da sessão", async () => {

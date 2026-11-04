@@ -1,6 +1,6 @@
 import { type NextRequest } from "next/server";
 import { z } from "zod";
-import { requirePlatformAdmin } from "@/lib/auth/requirePlatformAdmin";
+import { falhaDaEscritaDePlatformAdmin, requirePlatformAdmin } from "@/lib/auth/requirePlatformAdmin";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
@@ -73,8 +73,8 @@ export async function GET(req: NextRequest) {
   let adminCtx: Awaited<ReturnType<typeof requirePlatformAdmin>>;
   try {
     adminCtx = await requirePlatformAdmin();
-  } catch {
-    return fail("forbidden", "Platform admin required", 403, { requestId });
+  } catch (err) {
+    return falhaDaEscritaDePlatformAdmin(err, requestId);
   }
 
   const parsed = querySchema.safeParse(Object.fromEntries(req.nextUrl.searchParams.entries()));
@@ -114,6 +114,20 @@ export async function GET(req: NextRequest) {
 
   const orgIds = (orgs ?? []).map((o: { id: string }) => o.id);
 
+  // Pessoal não soma (spec 21, caminho 10): a mensagem do pessoal entra no
+  // banco, mas o uso da plataforma conta operação — e pessoal saiu dela.
+  // Marcados um a um, à mão: a lista é curta por construção.
+  let pessoais: string[] = [];
+  if (orgIds.length > 0) {
+    const { data: marcados } = await admin
+      .from("contacts")
+      .select("id")
+      .in("organization_id", orgIds)
+      .eq("is_personal", true)
+      .limit(2000);
+    pessoais = ((marcados ?? []) as Array<{ id: string }>).map((c) => c.id);
+  }
+
   // Compute start date
   const startDate = new Date();
   startDate.setDate(startDate.getDate() - days);
@@ -122,11 +136,15 @@ export async function GET(req: NextRequest) {
   // ---- messages count per org ----
   const messagesCountMap = new Map<string, number>();
   if (orgIds.length > 0) {
-    const { data: msgRows, error: msgErr } = await admin
+    let consulta = admin
       .from("messages")
       .select("organization_id")
       .in("organization_id", orgIds)
       .gte("created_at", startIso);
+    if (pessoais.length > 0) {
+      consulta = consulta.not("contact_id", "in", `(${pessoais.join(",")})`);
+    }
+    const { data: msgRows, error: msgErr } = await consulta;
     if (!msgErr && msgRows) {
       for (const row of msgRows) {
         const oid = row.organization_id as string;

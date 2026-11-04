@@ -5,6 +5,7 @@ import { env } from "@/lib/env";
 import { fetchDoServidor } from "@/lib/supabase/fetch-do-servidor";
 import { urlDoSupabaseNoServidor } from "@/lib/supabase/url-do-servidor";
 import { isPublicPath } from "@/lib/auth/public-paths";
+import { CABECALHO_SEM_CSS, PARAMETRO_SEM_CSS } from "@/lib/branding/sem-css-personalizado";
 import {
   verifyImpersonateCookieEdge,
   IMPERSONATE_COOKIE_NAME_EDGE,
@@ -13,6 +14,17 @@ import {
 const COOKIE_NAME = "sb-deskcomm-auth";
 
 export async function proxy(request: NextRequest) {
+  // Saída de emergência do CSS personalizado. ANTES do `NextResponse.next`: ele
+  // copia os cabeçalhos da requisição no momento em que é criado, e o que for
+  // posto depois não chega aos Server Components. Sempre gravado, para um
+  // cabeçalho forjado pelo cliente não valer.
+  request.headers.set(
+    CABECALHO_SEM_CSS,
+    request.nextUrl.searchParams.has(PARAMETRO_SEM_CSS) ? "1" : "0",
+  );
+  // O caminho atual, para os Server Components (o `next` do desafio de MFA em
+  // `exigirProvaDeMfa`). Mesma regra: antes do `next`, e sempre gravado.
+  request.headers.set("x-pathname", request.nextUrl.pathname);
   const response = NextResponse.next({ request: { headers: request.headers } });
 
   // Inject X-Request-Id for downstream correlation (audit log, error wrappers).
@@ -34,9 +46,6 @@ export async function proxy(request: NextRequest) {
     landing.headers.set("Referrer-Policy", "no-referrer");
     return landing;
   }
-  // Expose pathname to Server Components via header (used by onboarding layout).
-  response.headers.set("x-pathname", pathname);
-  request.headers.set("x-pathname", pathname);
 
   // EPIC-11: the admin surface is reached by PATH (`/admin/*`) — the self-host kit
   // points `NEXT_PUBLIC_ADMIN_URL` at the same host as the app and maps no `admin.`

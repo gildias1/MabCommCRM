@@ -12,13 +12,16 @@ import {
   getConversationHandler,
 } from "@/app/api/v1/conversations/_handler";
 import { listMessagesHandler } from "@/app/api/v1/messages/_handler";
+import { ApiError } from "@/lib/api/types";
 import { audit } from "@/lib/audit";
 import {
   criarRascunho,
   JANELA_MAXIMA_HORAS,
   TEXTO_MAXIMO,
 } from "@/lib/inbox/rascunho-sugerido";
+import { VALIDADE_DO_LINK_DE_MIDIA_S } from "@/lib/messaging/media/link-temporario";
 import { getQueuePositions } from "@/lib/routing/queue";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { resolveUserNames } from "./_users";
 import type { McpToolDefinition } from "../types";
 
@@ -56,12 +59,30 @@ export const crmListConversations: McpToolDefinition<typeof listInputShape> = {
   name: "crm_list_conversations",
   description:
     "Lista conversas do CRM com filtros opcionais por contato e status. Retorna preview da ultima mensagem. " +
-    "Campos de governança por conversa: assignee_kind ('user'|'ai'|null), assigned_to_user_id + assigned_to_user_name (só o nome do atendente, sem email/telefone), tags[], e queue_position (posição 1-based na fila do inbox — só quando na fila, senão null).",
+    "Campos de governança por conversa: assignee_kind ('user'|'ai'|null), assigned_to_user_id + assigned_to_user_name (só o nome do atendente, sem email/telefone), tags[], e queue_position (posição 1-based na fila do inbox — só quando na fila, senão null). " +
+    "Em conversa de atendimento, devolve apenas as conversas do contato desta conversa.",
   inputSchema: listInputShape,
   category: "read",
   requiresRole: "agent",
   requiresScope: "mcp:read",
   handler: async (input, ctx) => {
+    // ── QUEM ESTÁ NA OUTRA PONTA (#2178 → #2184) ──────────────────────────
+    //
+    // `ctx.contatoDoTurno` é contexto de CONFIANÇA (injetado por
+    // `lib/ai/runtime/tools.ts`, nunca escrito pelo modelo); sem ele — rota
+    // HTTP, MCP externo, agente sem conversa — `contatoEfetivo` é o
+    // `contact_id` pedido, ou nada. Sem contato, a listagem é a de antes; com
+    // `contact_id` pedido, o filtro agora vai na consulta e não na página.
+    const doTurno = ctx.contatoDoTurno;
+    // ESCOPO, e não tradução: com o contato do turno na mão, pedir
+    // explicitamente o contato de OUTRO cliente é interseção vazia — devolver
+    // as conversas do turno responderia outra pergunta, e devolver as do
+    // cliente pedido deixaria o texto do lado de lá sair pelo turno. A lista
+    // vazia é a resposta honesta aos dois lados, e é o que já acontecia.
+    if (doTurno && input.contact_id && input.contact_id !== doTurno) {
+      return { conversations: [], cursor: null, has_more: false };
+    }
+    const contatoEfetivo = doTurno ?? input.contact_id;
     const result = await listConversationsHandler(
       ctx.supabase,
       {
@@ -84,14 +105,31 @@ export const crmListConversations: McpToolDefinition<typeof listInputShape> = {
         // omitir a chave seria erro de tipo — não omissão silenciosa.
         tag: undefined,
         modo: undefined,
+        // O CONTATO VAI NA CONSULTA, não no recorte depois dela (#2184).
+        // Filtrar a página já truncada escondia a conversa mais antiga do
+        // mesmo cliente (fora da página) e deixava o cursor descrevendo a
+        // varredura da organização; no `WHERE`, cursor e `has_more` passam a
+        // ser honestos para o conjunto do contato.
+        contact_id: contatoEfetivo,
         limit: input.limit,
         cursor: input.cursor,
       },
     );
-    let conversations = result.conversations;
-    if (input.contact_id) {
-      conversations = conversations.filter((c) => c.contact_id === input.contact_id);
-    }
+    const conversations = result.conversations;
+    // ── O ESCOPO AGORA MORA NO `WHERE`, E A PAGINAÇÃO SEGUE VIVA (#2184) ──
+    //
+    // Aqui havia um filtro em memória sobre a página devolvida pelo handler, e
+    // com ele o `cursor`/`has_more` eram zerados ("a próxima página voltaria a
+    // ser varredura"). O defeito medido na issue: com 10 conversas por página,
+    // a conversa mais antiga do mesmo cliente fora daquela página ficava
+    // invisível para o agente, e o `has_more: false` dizia que não havia mais
+    // nada. Com o contato no predicado, a página É do cliente — a próxima
+    // página também, então os dois voltam a valer.
+    //
+    // Mesmo escopo do #2175: a listagem filtra `organization_id`, então não há
+    // vazamento entre ORGANIZAÇÕES, mas alcançava os outros clientes da MESMA
+    // organização — com `last_message_preview` junto, que é texto do lado de
+    // lá indo para o WhatsApp do cliente A, encaminhável, sem volta.
     // Nomes (dedupe) e posições de fila (1 query cada) — sem N+1 na listagem.
     const names = await resolveUserNames(
       ctx.supabase,
@@ -132,21 +170,62 @@ export const crmGetConversation: McpToolDefinition<typeof getInputShape> = {
   name: "crm_get_conversation",
   description:
     "Retorna detalhes de uma conversa pelo UUID. Inclui status, atribuicao, contato, ultima atividade. " +
-    "Governança: assignee_kind ('user'|'ai'|null), assigned_to_user_id + assigned_to_user_name (só o nome, sem email/telefone), tags[], e queue_position (1-based na fila do inbox — null quando não está na fila).",
+    "Governança: assignee_kind ('user'|'ai'|null), assigned_to_user_id + assigned_to_user_name (só o nome, sem email/telefone), tags[], e queue_position (1-based na fila do inbox — null quando não está na fila). " +
+    "Em conversa de atendimento, devolve apenas conversas do contato desta conversa.",
   inputSchema: getInputShape,
   category: "read",
   requiresRole: "agent",
   requiresScope: "mcp:read",
   handler: async (input, ctx) => {
-    const conv = await getConversationHandler(
-      ctx.supabase,
-      {
-        organization_id: ctx.organizationId,
-        actor: ctx.actor,
-        requestId: ctx.requestId,
-      },
-      input.conversation_id,
-    );
+    let conv: Awaited<ReturnType<typeof getConversationHandler>> | null = null;
+    try {
+      conv = await getConversationHandler(
+        ctx.supabase,
+        {
+          organization_id: ctx.organizationId,
+          actor: ctx.actor,
+          requestId: ctx.requestId,
+        },
+        input.conversation_id,
+      );
+    } catch (e: unknown) {
+      // Com turno, o `404` (não existe, ou é de outra organização) vira a
+      // MESMA recusa da conversa de outro cliente, como no histórico: um uuid
+      // não ganha veredito sobre existência. Sem turno, sobe como antes; erro
+      // que não é `404` sobe sempre.
+      if (!(e instanceof ApiError) || e.status !== 404) throw e;
+      if (ctx.contatoDoTurno) {
+        conv = null;
+      } else {
+        throw e;
+      }
+    }
+    // ── A CONVERSA DE QUEM NÃO É DESTA CONVERSA NÃO ABRE AQUI (#2178) ────────
+    //
+    // RECUSA, e não tradução: trocar o uuid pedido pelo da conversa do turno
+    // faria o modelo perguntar por uma conversa e receber outra — a mesma
+    // razão que `crm_get_contact` recusa em vez de trocar (#2158).
+    //
+    // A ida ao handler ACONTECE porque é ela que diz de quem é a conversa
+    // (`conversation_id` não carrega `contact_id`); o que não sai daqui é a
+    // RESPOSTA — o registro de B é descartado e o modelo vê a recusa, no
+    // mesmo formato que `negocioDaEscritaDoTurno` devolve, auditada como
+    // recusa pelo runtime (`contato_da_conversa:fora_da_conversa`).
+    //
+    // `ctx.contatoDoTurno` é contexto de CONFIANÇA (injetado por
+    // `lib/ai/runtime/tools.ts`, nunca escrito pelo modelo); sem ele — rota
+    // HTTP, MCP externo, agente sem conversa — qualquer conversa da
+    // organização segue abrindo como antes. O Operador recebe o contato do
+    // turno e também fica escopado.
+    if (!conv || (ctx.contatoDoTurno && conv.contact_id !== ctx.contatoDoTurno)) {
+      return {
+        permitido: false,
+        motivo: "fora_da_conversa",
+        mensagem:
+          "esta conversa é com outra pessoa — abrir a conversa de um cliente que não é o desta " +
+          "conversa não é sua para ler; siga a conversa com quem está falando.",
+      };
+    }
     const names = await resolveUserNames(ctx.supabase, [conv.assigned_to_user_id]);
     const queue_position = isInQueue(conv)
       ? ((await getQueuePositions(ctx.supabase, ctx.organizationId)).get(conv.id) ?? null)
@@ -182,25 +261,157 @@ const historyInputShape = {
   cursor: z.string().optional(),
 };
 
+const MEDIA_BUCKET = "whatsapp-media";
+
+export type MediaDoHistorico = {
+  /**
+   * `ready`: arquivo guardado; `pending`: a mensagem tem mídia mas o worker
+   * ainda não a guardou (ou o link falhou) — quem consome tenta de novo depois;
+   * `expired`: apagada pela retenção (o mesmo marcador que faz a rota de mídia
+   * responder 410); ausente no mapa = mensagem sem mídia.
+   */
+  status: "ready" | "pending" | "expired";
+  signedUrl: string | null;
+};
+
+type MensagemComMidia = {
+  id: string;
+  media_url?: string | null;
+  media_storage_path?: string | null;
+  metadata?: Record<string, unknown> | null;
+};
+
+/** A mesma régua da rota de mídia: sem arquivo, sem endereço e com o marcador da retenção. */
+const expirou = (m: MensagemComMidia) =>
+  !m.media_storage_path && !m.media_url && m.metadata?.media_status === "expired";
+
+/**
+ * Para cada mensagem do histórico que carrega mídia, diz o estado e, com
+ * `comLink`, gera o link temporário do arquivo guardado. Nunca lança: falha ao
+ * assinar vira `pending` (a conversa continua legível). Só toca no storage se
+ * houver link a assinar.
+ */
+export async function resolverMidiasDoHistorico(
+  messages: ReadonlyArray<MensagemComMidia>,
+  { comLink = true }: { comLink?: boolean } = {},
+): Promise<Map<string, MediaDoHistorico>> {
+  const out = new Map<string, MediaDoHistorico>();
+  const comMidia = messages.filter((m) => m.media_storage_path || m.media_url || expirou(m));
+  if (comMidia.length === 0) return out;
+
+  const aAssinar: Array<{ id: string; caminho: string }> = [];
+  for (const m of comMidia) {
+    if (expirou(m)) out.set(m.id, { status: "expired", signedUrl: null });
+    else if (!m.media_storage_path) out.set(m.id, { status: "pending", signedUrl: null });
+    else if (!comLink) out.set(m.id, { status: "ready", signedUrl: null });
+    else aAssinar.push({ id: m.id, caminho: m.media_storage_path });
+  }
+  if (aAssinar.length === 0) return out;
+
+  const storage = createAdminClient().storage.from(MEDIA_BUCKET);
+  await Promise.all(
+    aAssinar.map(async (m) => {
+      try {
+        const { data, error } = await storage.createSignedUrl(m.caminho, VALIDADE_DO_LINK_DE_MIDIA_S);
+        out.set(
+          m.id,
+          error || !data?.signedUrl
+            ? { status: "pending", signedUrl: null }
+            : { status: "ready", signedUrl: data.signedUrl },
+        );
+      } catch {
+        out.set(m.id, { status: "pending", signedUrl: null });
+      }
+    }),
+  );
+  return out;
+}
+
 export const crmGetConversationHistory: McpToolDefinition<typeof historyInputShape> = {
   name: "crm_get_conversation_history",
   description:
-    "Carrega historico de mensagens de uma conversa. Use para dar contexto ao agente sem inflar o system prompt.",
+    "Carrega historico de mensagens de uma conversa. Use para dar contexto ao agente sem inflar o system prompt." +
+    " Em conversa de atendimento, devolve apenas o histórico da conversa do contato desta conversa.",
   inputSchema: historyInputShape,
   category: "read",
   requiresRole: "agent",
   requiresScope: "mcp:read",
   handler: async (input, ctx) => {
-    const result = await listMessagesHandler(
-      ctx.supabase,
-      {
-        organization_id: ctx.organizationId,
-        actor: ctx.actor,
-        requestId: ctx.requestId,
-      },
-      input.conversation_id,
-      { limit: input.limit, cursor: input.cursor },
-    );
+    // ── O HISTÓRICO DE QUEM NÃO É DESTA CONVERSA NÃO SAI DAQUI (#2178) ──────
+    //
+    // A mesma recusa de `crm_get_conversation`, e ANTES de ler as mensagens:
+    // o histórico é a leitura que mais sai do prédio (texto de ponta a
+    // ponta), e carregar a página de B só para jogá-la fora seria deixar o
+    // dado do outro cliente entrar na memória do turno sem necessidade.
+    //
+    // A conferência é a do `getConversationHandler` — a MESMA que a tela usa
+    // —, porque `listMessagesHandler` recebe o uuid da conversa e não devolve
+    // `contact_id`. Aqui ela custa uma ida extra ao banco, e só quando há
+    // contato do turno: sem ele, o caminho é idêntico ao de antes.
+    //
+    // ── O `404` NÃO PODE VIRAR ORÁCULO (#2184) ────────────────────────────
+    //
+    // O handler responde `404 not_found` para DUAS coisas que ele não
+    // distingue, de propósito: o id não existe, e o id é de outra
+    // organização — a consulta filtra `organization_id` e os dois viram a
+    // mesma "linha ausente". Com o 404 subindo, o turno ficava respondendo
+    // `404` para um uuid inexistente e `fora_da_conversa` para a conversa do
+    // outro cliente: dois estados distintos para o MESMO "não é seu para
+    // ler", e o primeiro deles ainda mudava conforme um campo de contexto
+    // (sem contato do turno, o uuid inexistente segue devolvendo lista vazia).
+    //
+    // Por isso o `404` vira a MESMA recusa do cliente de outro contato. O
+    // contrato do handler não muda (a rota HTTP continua respondendo `404`),
+    // quem erra o uuid não ganha um veredito sobre existência, e as três
+    // respostas — não existe, é de outra organização, é de outro cliente —
+    // ficam byte a byte iguais. `ApiError` que não seja `404` sobe: infra não
+    // é limite de negócio (mesma regra de `lib/mcp/tools/agendamento.ts`).
+    if (ctx.contatoDoTurno) {
+      let conv: { contact_id: string | null } | null = null;
+      try {
+        conv = await getConversationHandler(
+          ctx.supabase,
+          {
+            organization_id: ctx.organizationId,
+            actor: ctx.actor,
+            requestId: ctx.requestId,
+          },
+          input.conversation_id,
+        );
+      } catch (e) {
+        if (!(e instanceof ApiError) || e.status !== 404) throw e;
+        conv = null;
+      }
+      if (!conv || conv.contact_id !== ctx.contatoDoTurno) {
+        return {
+          permitido: false,
+          motivo: "fora_da_conversa",
+          mensagem:
+            "esta conversa é com outra pessoa — o histórico de um cliente que não é o desta " +
+            "conversa não é seu para ler; siga a conversa com quem está falando.",
+        };
+      }
+    }
+    let result: Awaited<ReturnType<typeof listMessagesHandler>>;
+    try {
+      result = await listMessagesHandler(
+        ctx.supabase,
+        {
+          organization_id: ctx.organizationId,
+          actor: ctx.actor,
+          requestId: ctx.requestId,
+        },
+        input.conversation_id,
+        { limit: input.limit, cursor: input.cursor },
+      );
+    } catch (e: unknown) {
+      throw e;
+    }
+    // No turno do agente de atendimento o link NÃO sai: ele vale como portador
+    // por 1h para foto ou áudio de cliente, iria para o provedor de IA e para os
+    // registros da rodada, e o agente não tem como abri-lo. Tipo e estado ficam.
+    // Pela API (sem contato do turno) o link sai normalmente.
+    const media = await resolverMidiasDoHistorico(result.messages, { comLink: !ctx.contatoDoTurno });
     return {
       messages: result.messages.map((m) => ({
         id: m.id,
@@ -208,6 +419,13 @@ export const crmGetConversationHistory: McpToolDefinition<typeof historyInputSha
         type: m.type,
         body: m.body,
         media_url: m.media_url,
+        // Mídia utilizável por quem consome pela API: tipo, tamanho e um link
+        // temporário do arquivo já guardado (`media_url` é o endereço interno do
+        // gateway e não serve fora dele). Ver `resolverMidiasDoHistorico`.
+        media_mime: m.media_mime ?? null,
+        media_size_bytes: m.media_size_bytes ?? null,
+        media_status: media.get(m.id)?.status ?? "none",
+        media_signed_url: media.get(m.id)?.signedUrl ?? null,
         sent_via: m.sent_via,
         sent_at: m.sent_at,
         status: m.status,

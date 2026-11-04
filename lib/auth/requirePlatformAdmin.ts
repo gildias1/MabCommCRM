@@ -9,15 +9,23 @@
  * Redirects:
  *  - no user        → /login?next=/admin
  *  - no row         → /admin/forbidden
- *  - aal1 + required → /login/mfa?next=/admin
+ *  - aal1 + (required OU fator cadastrado) → /login/mfa?next=<caminho atual de
+ *    /admin> numa tela;
+ *    numa rota, 403 `mfa_required` (ver `desafioDeMfa`)
  *
  * The middleware already does an early `fn_is_platform_admin` RPC check;
  * this helper performs the authoritative server-side validation inside the
  * /admin layout (where redirects are cheap, DB calls are allowed in Node
  * runtime, and we have access to AAL state).
  */
+import { headers } from "next/headers";
 import { redirect } from "next/navigation";
+import type { NextResponse } from "next/server";
 import type { User } from "@supabase/supabase-js";
+import { fail, type ApiError } from "@/lib/api/wrappers";
+import { EscritaDePlatformAdminNegada } from "@/lib/auth/recusa-de-escrita-de-admin";
+import { safeNext } from "@/lib/auth/safe-next";
+import { mfaEmDividaEstrita } from "@/lib/auth/server";
 import { createClient } from "@/lib/supabase/server";
 
 export interface PlatformAdminInfo {
@@ -53,11 +61,13 @@ export async function requirePlatformAdmin(): Promise<PlatformAdminContext> {
     redirect("/admin/forbidden");
   }
 
-  if (paRow.mfa_required) {
+  // Quem TEM fator prova nesta sessão, exigido ou não pela política — a mesma
+  // regra de `mfaEmDivida`. Os fatores vêm do `getUser()` acima, já validado no
+  // servidor: nenhuma leitura a mais.
+  const temFator = !!user.factors?.some((f) => f.factor_type === "totp" && f.status === "verified");
+  if (paRow.mfa_required || temFator) {
     const { data: aalData } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
-    if (aalData?.currentLevel !== "aal2") {
-      redirect("/login/mfa?next=/admin");
-    }
+    if (aalData?.currentLevel !== "aal2") await desafioDeMfa();
   }
 
   return {
@@ -68,4 +78,69 @@ export async function requirePlatformAdmin(): Promise<PlatformAdminContext> {
       mfa_required: paRow.mfa_required,
     },
   };
+}
+
+/**
+ * A sessão que não provou o fator: a TELA vai ao desafio, de volta para a página
+ * do painel onde estava, e a ROTA responde 403 `mfa_required`, com um erro só.
+ * O caminho vem do `x-pathname` do `proxy.ts`; fora de `/admin` (a URL de uma
+ * rota de API) ou recusado por `safeNext`, o destino é `/admin`.
+ *
+ * O `digest` copiado do `redirect()` é o que o runtime do Next lê para
+ * redirecionar o layout de `/admin`; a rota, que captura
+ * o erro, o lê como a recusa nomeada (`falhaDaEscritaDePlatformAdmin`), e a
+ * server action, como `{ ok: false, error: "mfa_required" }`.
+ */
+async function desafioDeMfa(): Promise<never> {
+  const caminho = (await headers()).get("x-pathname");
+  const destino = /^\/admin(\/|$)/.test(caminho ?? "") ? safeNext(caminho, "/admin") : "/admin";
+  try {
+    redirect(`/login/mfa?next=${encodeURIComponent(destino)}`);
+  } catch (redirecionamento) {
+    const recusa = new EscritaDePlatformAdminNegada("mfa_required");
+    throw Object.assign(recusa, {
+      digest: redirecionamento instanceof Error && "digest" in redirecionamento ? redirecionamento.digest : undefined,
+    });
+  }
+}
+
+// A classe mora no módulo sem `next/*` para o formulário ler a mesma frase.
+export { EscritaDePlatformAdminNegada };
+
+/**
+ * `requirePlatformAdmin()` + o que a ESCRITA exige e a leitura não:
+ * `scope === 'full'` (o `support_readonly` lê o painel e nada muda) e sessão sem
+ * dívida de MFA (quem TEM fator prova nesta sessão).
+ *
+ * `requirePlatformAdmin` devolvia o scope sem impor; só `admin/tenants` POST e as
+ * rotas de extensões conferiam. A cerca `tests/unit/admin-escrita-exige-scope-full.test.ts`
+ * exige este helper em todo handler de escrita e em toda server action de admin.
+ *
+ * Mantém o contrato de `requirePlatformAdmin` (quem não é platform admin é
+ * REDIRECIONADO); as duas recusas novas LANÇAM `EscritaDePlatformAdminNegada`.
+ */
+export async function requirePlatformAdminEscrita(): Promise<PlatformAdminContext> {
+  const ctx = await requirePlatformAdmin();
+  if (ctx.platformAdmin.scope !== "full") {
+    throw new EscritaDePlatformAdminNegada("forbidden_scope");
+  }
+  if (await mfaEmDividaEstrita()) {
+    throw new EscritaDePlatformAdminNegada("mfa_required");
+  }
+  return ctx;
+}
+
+/**
+ * Resposta de rota para o que `requirePlatformAdmin` ou `requirePlatformAdminEscrita`
+ * lançou — leitura e escrita. A recusa nomeada vira o seu código (`mfa_required`,
+ * `forbidden_scope`); o resto (redirect de quem não é platform admin, sessão
+ * ilegível) vira o 403 `forbidden` que as rotas de admin já davam.
+ */
+export function falhaDaEscritaDePlatformAdmin(
+  err: unknown,
+  requestId?: string,
+  mensagemDeRecusa = "Platform admin required",
+): NextResponse<ApiError> {
+  if (err instanceof EscritaDePlatformAdminNegada) return fail(err.code, err.message, 403, { requestId });
+  return fail("forbidden", mensagemDeRecusa, 403, { requestId });
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useEffect, useState, useTransition } from "react";
 import { toast } from "sonner";
 import { useT } from "@/hooks/i18n/useT";
 
@@ -15,32 +15,34 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { FUSO_PADRAO, FUSOS_DO_ONBOARDING } from "@/lib/tempo/fusos";
+import { fusoDoNavegador } from "@/lib/tempo/fuso-do-navegador";
 
-/**
- * Cidade, não identificador de fuso. A lista mostrava "America/Bahia" e
- * "America/Fortaleza" e esperava que a pessoa soubesse em qual delas mora — o
- * identificador é do sistema, o que ela reconhece é a cidade.
- */
-const FUSOS: { id: string; cidade: string }[] = [
-  { id: "America/Sao_Paulo", cidade: "São Paulo, Rio, Brasília, Sul e Sudeste" },
-  { id: "America/Recife", cidade: "Recife, Salvador, Fortaleza e Nordeste" },
-  { id: "America/Belem", cidade: "Belém e Pará" },
-  { id: "America/Manaus", cidade: "Manaus e Amazonas" },
-  { id: "America/Cuiaba", cidade: "Cuiabá e Mato Grosso" },
-  { id: "America/Rio_Branco", cidade: "Rio Branco e Acre" },
-  { id: "America/Argentina/Buenos_Aires", cidade: "Buenos Aires" },
-  { id: "Europe/Lisbon", cidade: "Lisboa" },
-  { id: "Europe/Madrid", cidade: "Madri" },
-  { id: "America/New_York", cidade: "Nova York" },
-  { id: "America/Los_Angeles", cidade: "Los Angeles" },
-  { id: "UTC", cidade: "Outro (horário universal)" },
-];
 
-export function WelcomeForm({ defaultOrgName }: { defaultOrgName: string }) {
+export function WelcomeForm({
+  defaultOrgName,
+  orgId,
+}: {
+  defaultOrgName: string;
+  orgId: string;
+}) {
   const t = useT();
   const [displayName, setDisplayName] = useState(defaultOrgName);
   const [oQueFaz, setOQueFaz] = useState("");
-  const [timezone, setTimezone] = useState("America/Sao_Paulo");
+  const [timezone, setTimezone] = useState(FUSO_PADRAO);
+
+  // O fuso do NAVEGADOR (se for um oferecido) vem marcado no lugar de São
+  // Paulo: é o mesmo com que a empresa nasceu (`lib/auth/perfil-da-empresa-nova.ts`),
+  // e este passo regrava o fuso da empresa com o que estiver marcado. Num
+  // efeito, e não no estado inicial, porque o servidor não sabe o fuso do
+  // navegador — e a hidratação divergiria.
+  useEffect(() => {
+    const doNavegador = fusoDoNavegador();
+    // Uma leitura só, depois da hidratação, de um valor que só o navegador
+    // tem: não há prop nem estado anterior de onde derivar no render.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (doNavegador && FUSOS_DO_ONBOARDING.some((f) => f.id === doNavegador)) setTimezone(doNavegador);
+  }, []);
   const [accepted, setAccepted] = useState(false);
   const [pending, startTransition] = useTransition();
 
@@ -107,7 +109,7 @@ export function WelcomeForm({ defaultOrgName }: { defaultOrgName: string }) {
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            {FUSOS.map((f) => (
+            {FUSOS_DO_ONBOARDING.map((f) => (
               <SelectItem key={f.id} value={f.id}>
                 {t(f.cidade)}
               </SelectItem>
@@ -115,6 +117,10 @@ export function WelcomeForm({ defaultOrgName }: { defaultOrgName: string }) {
           </SelectContent>
         </Select>
         <input type="hidden" name="timezone" value={timezone} />
+        {/* A org para a qual ESTA aba foi aberta. No submit, o server action
+            resolve por ela (validada como membership), não pela org ativa do
+            momento — que outra aba pode ter trocado. */}
+        <input type="hidden" name="organization_id" value={orgId} />
         <p className="text-xs text-muted-foreground">
           {t("Decide o horário em que seu funcionário pode falar com clientes.")}
         </p>

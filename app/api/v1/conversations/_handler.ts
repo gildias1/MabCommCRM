@@ -9,6 +9,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { ApiError } from "@/lib/api/types";
 import type { Actor, HandlerCtx } from "@/lib/api/handlers/types";
 import { audit } from "@/lib/audit";
+import { idsDosCanaisDesativados } from "@/lib/channels/desativado";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { CONVERSATION_TERMINAL_STATUSES } from "@/lib/schemas";
 import type {
@@ -16,9 +17,10 @@ import type {
   PatchConversationInput,
 } from "@/lib/schemas";
 import type { Conversation } from "@/lib/types/messaging";
-import { normalizarTermoDeBusca } from "@/lib/inbox/termo-de-busca";
+import { normalizarTermoDeBusca, termoSemAcento } from "@/lib/inbox/termo-de-busca";
 import { ORDEM_DA_ESPERA, ehAFila } from "@/lib/inbox/comando-da-conversa";
 import { aplicarMarcadores } from "@/lib/inbox/marcador-da-conversa";
+import { exigirControleDaConversa } from "@/lib/inbox/controle-da-conversa";
 
 /**
  * Prepara o termo digitado para viajar dentro de um `or=` do PostgREST.
@@ -91,9 +93,37 @@ const SELECT_COLS = `
   snooze_until, created_at, updated_at,
   bot_silenced_until, last_handoff_at, last_handoff_reason,
   comando_da_conversa,
-  contacts:contact_id (id, display_name, name, phone_number, is_anonymized, tags, is_blocked, avatar_storage_path, force_human),
+  usable_for_rag,
+  contacts:contact_id (id, display_name, name, address_book_name, phone_number, is_anonymized, tags, is_blocked, is_personal, contact_type, avatar_storage_path, force_human),
   channel_sessions:channel_session_id (phone_number, display_name, provider, social_platform:metadata->>social_platform)
 `;
+
+/**
+ * Os ids dos contatos marcados como pessoais na organização (spec 21, etapa 7).
+ *
+ * A conversa de pessoal some da lista, da busca e das contagens — e `conversations`
+ * não tem a coluna, então quem filtra precisa dos ids antes da query principal
+ * (a mesma primitiva da busca por contato). Cortados pelo orçamento da URL, como
+ * os da busca: pessoal se marca um a um, à mão, então a lista é curta por
+ * construção — mas o teto impede o `414` se um dia não for.
+ *
+ * Exportado porque a rota de contagens (`counts/route.ts`) aplica a MESMA
+ * exclusão: badge que conta o que a aba não mostra manda o atendente procurar
+ * trabalho que não existe.
+ */
+export async function idsDeContatosPessoais(
+  supabase: SB,
+  organizationId: string,
+): Promise<string[]> {
+  const { data } = await supabase
+    .from("contacts")
+    // Service role bypassa RLS: o filtro de organização é manual e obrigatório.
+    .select("id")
+    .eq("organization_id", organizationId)
+    .eq("is_personal", true)
+    .limit(500);
+  return idsQueCabemNaURL((data ?? []).map((c) => (c as { id: string }).id));
+}
 
 interface CursorPayload {
   sort: string | null;
@@ -179,6 +209,14 @@ export async function listConversationsHandler(
     .order("id", { ascending: asc })
     .limit(q.limit + 1);
 
+  // Contato pessoal some da lista (spec 21, etapa 7 — critério 1): conversa cujo
+  // contato é pessoal não aparece em nenhuma visão. ANTES de todo filtro
+  // opcional, para que cursor e `has_more` descrevam o conjunto já escondido.
+  const pessoais = await idsDeContatosPessoais(supabase, ctx.organization_id);
+  if (pessoais.length > 0) {
+    query = query.not("contact_id", "in", `(${pessoais.join(",")})`);
+  }
+
   // `.in` e não `.eq`: o filtro agora chega como LISTA (um valor vira lista de um,
   // e o SQL resultante é equivalente). É o que deixa a aba Fila pedir os dois
   // estados de espera numa consulta só, em vez de filtrar em memória o que a
@@ -197,6 +235,27 @@ export async function listConversationsHandler(
     query = query.not("status", "in", `(${CONVERSATION_TERMINAL_STATUSES.join(",")})`);
   }
   if (q.channel_session_id) query = query.eq("channel_session_id", q.channel_session_id);
+  // Canal desativado nunca entra na inbox (quarentena): exclui as conversas
+  // dele aqui e nos badges, mantendo o acesso direto por id para auditoria e
+  // suporte. Reativou, reaparecem sem reimportar nada.
+  const idsDesativados = await idsDosCanaisDesativados(supabase, ctx.organization_id);
+  if (idsDesativados.length > 0) {
+    query = query.not("channel_session_id", "in", `(${idsDesativados.join(",")})`);
+  }
+  // ── O CONTATO, NO PRÓPRIO `WHERE` (#2184) ──────────────────────────────
+  //
+  // `crm_list_conversations` filtrava o contato DEPOIS do handler devolver a
+  // página: a conversa mais antiga do mesmo cliente, fora daquela página, era
+  // inalcançável — e o `has_more: false` que saía junto dizia ao agente que
+  // não havia mais nada. Filtrar antes do `.limit` é o que faz cursor e
+  // `has_more` descreverem o conjunto DO CONTATO: a próxima página continua
+  // sendo do mesmo cliente.
+  //
+  // Compondo sobre a MESMA query, que já carrega `.eq("organization_id", …)` —
+  // este handler usa o admin client, que passa por cima da RLS: o filtro
+  // manual de organização é a única barreira, e uma consulta nova nasceria
+  // sem nenhuma.
+  if (q.contact_id) query = query.eq("contact_id", q.contact_id);
   // A aba "Grupos" (Task 10). `undefined` (ausente) = sem filtro, a lista
   // mostra tudo, como hoje — checagem explícita contra `undefined`, e não
   // `if (q.is_group)`, porque `"false"` é um valor válido e verdadeiro-truthy
@@ -247,7 +306,41 @@ export async function listConversationsHandler(
         '"assigned_to=me" requer ator humano.',
       );
     }
-    query = query.eq("assigned_to_user_id", ctx.actor.id);
+    // "Minhas" é também o que eu PARTICIPO: o convite é da conversa e a aba Minhas
+    // é onde a convidada tem de achar — medido com navegador na mão no CR de 24/10
+    // (#2848). Sem isto, com `own_and_unassigned` ela nem alcança a aba "Todas" e a
+    // conversa não aparece em lugar nenhum: Fila 0, Minhas 0.
+    //
+    // Sem participações o predicado é o MESMO de antes (`.eq`), byte a byte: o `or`
+    // só nasce quando existe convite de pé, então quem não participa de nada mede o
+    // mesmo de sempre. Quando existe, o `or=` compõe por AND com os demais
+    // (organização, busca, cursor): o PostgREST junta parâmetros repetidos com E.
+    // ⚠️ Se esta pergunta falhar (banco fora, mock de teste sem `.is`), o caminho
+    // é o de SEMPRE (`.eq`): o filtro nunca muda de regra sozinho, só ganha as
+    // conversas de quem participa quando a pergunta responde.
+    let idsParticipadas: string[] = [];
+    try {
+      const participadas = await supabase
+        .from("conversation_participants")
+        .select("conversation_id")
+        .eq("organization_id", ctx.organization_id)
+        .eq("user_id", ctx.actor.id)
+        .is("left_at", null);
+      idsParticipadas = (participadas.data ?? []).map((r) => r.conversation_id);
+    } catch {
+      idsParticipadas = [];
+    }
+    if (idsParticipadas.length > 0) {
+      // ⚠️ participações ativas são convites manuais (poucas por pessoa) — daí
+      // entrarem juntas no `in()`. Se um dia alguém participar de centenas, este
+      // `or=` fica longo; aí o conserto é subquery via RPC — e nunca corte
+      // silencioso: um corte escondido manda a convidada voltar a não achar.
+      query = query.or(
+        `assigned_to_user_id.eq.${ctx.actor.id},id.in.(${idsParticipadas.join(",")})`,
+      );
+    } else {
+      query = query.eq("assigned_to_user_id", ctx.actor.id);
+    }
   } else if (q.assigned_to === "unassigned") {
     query = query.is("assigned_to_user_id", null);
   } else if (q.assigned_to) {
@@ -320,8 +413,33 @@ export async function listConversationsHandler(
     const pareceTelefone = somenteDigitos.length >= 4;
 
     const camposDoContato = [
-      `display_name.ilike.*${s}*`,
-      `name.ilike.*${s}*`,
+      // ─── O NOME DO CONTATO CASA SEM ACENTO (#3918) ────────────────────────
+      //
+      // Aqui havia `display_name.ilike.*s*`, `name.ilike.*s*` e
+      // `address_book_name.ilike.*s*`, e os três tinham o mesmo buraco: `ILIKE`
+      // dobra a CAIXA, não o ACENTO. `lower('Á') = 'á'`, que não é `'a'` — quem
+      // digita "Andreia" não acha "Andréia", e quem digita "Andréia" não acha
+      // quem foi cadastrado sem acento. No Brasil as duas grafias convivem, e o
+      // atendente digita rápido, sem acento: o cliente parece não existir.
+      //
+      // A correção precisa dos DOIS lados normalizados, e é por isso que ela não
+      // caberia só aqui: limpar o termo e comparar com a coluna crua continua
+      // devolvendo zero. O lado do banco é a coluna GERADA
+      // `contacts.busca_sem_acento` — `lower(public.f_unaccent(display_name,
+      // name, address_book_name))`, com índice `pg_trgm` (migration 9098) —, e o
+      // lado do termo é `termoSemAcento`, que é a mesma régua em TypeScript.
+      // As duas são comparadas por `tests/invariants/busca-do-inbox-ignora-acento.test.ts`.
+      //
+      // Por que `like` e não `ilike`: a coluna já é minúscula. `like` sobre ela
+      // com o termo minúsculo dá o mesmo resultado sem depender de o plano
+      // dobrar caixa em cima de uma coluna gerada — e o índice GIN de trigrama
+      // serve os dois operadores.
+      //
+      // O nome da agenda do celular (#2439) continua entrando: ele é a terceira
+      // parte da coluna gerada, e a lista o mostra — a busca tem de achá-lo.
+      `busca_sem_acento.like.*${termoSemAcento(s)}*`,
+      // O telefone tem OUTRO caminho: dígitos não têm acento, e o número é
+      // comparado só por dígitos (o `somenteDigitos` descarta o resto).
       ...(pareceTelefone ? [`phone_number.ilike.*${somenteDigitos}*`] : []),
     ].join(",");
 
@@ -333,6 +451,9 @@ export async function listConversationsHandler(
       // Anonimizar é direito do titular. Voltar a encontrá-lo pelo nome antigo
       // criaria um vazamento onde não havia.
       .eq("is_anonymized", false)
+      // Pessoal não é achado pela busca (spec 21, etapa 7 — critério 2): nem por
+      // nome, nem por telefone. A prévia segue pelo `.not` da query principal.
+      .eq("is_personal", false)
       .or(camposDoContato)
       // Teto obrigatório: a lista de ids viaja na URL do PostgREST, e uma busca
       // por "a" sem limite estoura a requisição.
@@ -355,9 +476,27 @@ export async function listConversationsHandler(
       // ou o formato do id mudarem.
       .limit(TETO_DE_CONTATOS_NA_BUSCA);
 
-    const ids = idsQueCabemNaURL(
-      (contatos ?? []).map((c) => (c as { id: string }).id),
-    );
+    // Ficha cujo TELEFONE EXTRA casa o número também entra na lista: a busca acima
+    // só olha o principal. A consulta embute a ficha e aplica os mesmos filtros de
+    // organização, anonimizado, pessoal e lápide — e não manda lista de ids na URL.
+    let idsDoExtra: string[] = [];
+    if (pareceTelefone) {
+      const { data: extras } = await supabase
+        .from("contact_phones")
+        .select("contact_id, contacts!inner(id)")
+        .eq("organization_id", ctx.organization_id)
+        .eq("contacts.organization_id", ctx.organization_id)
+        .eq("contacts.is_anonymized", false)
+        .eq("contacts.is_personal", false)
+        .is("contacts.is_merged_into", null)
+        .ilike("phone_number", `*${somenteDigitos}*`)
+        .limit(TETO_DE_CONTATOS_NA_BUSCA);
+      idsDoExtra = ((extras ?? []) as { contact_id: string }[]).map((r) => r.contact_id);
+    }
+
+    const ids = idsQueCabemNaURL([
+      ...new Set([...(contatos ?? []).map((c) => (c as { id: string }).id), ...idsDoExtra]),
+    ]);
     if (ids.length > 0) {
       query = query.or(
         `last_message_preview.ilike.*${s}*,contact_id.in.(${ids.join(",")})`,
@@ -437,6 +576,20 @@ export async function getConversationHandler(
       traduzir("Conversa não encontrada.", ctx.idioma ?? "pt-BR"),
     );
   }
+  // Pessoal some até por link direto (spec 21, D10 — critério 1): a conversa de
+  // contato pessoal responde 404, com a mesma mensagem de "não existe", para
+  // não revelar que ela está lá. O desmarcar acontece pela ficha de Contatos.
+  const pessoal = (data as unknown as { contacts?: { is_personal?: boolean } | null }).contacts
+    ?.is_personal;
+  if (pessoal === true) {
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Conversa não encontrada.", ctx.idioma ?? "pt-BR"),
+    );
+  }
   return data as unknown as Conversation;
 }
 
@@ -451,6 +604,10 @@ export async function patchConversationHandler(
   input: PatchConversationInput,
 ): Promise<Conversation> {
   const update: Record<string, unknown> = {};
+  const observed = input.status !== undefined
+    ? await getConversationHandler(supabase, ctx, conversationId)
+    : null;
+  if (observed) await exigirControleDaConversa(supabase, ctx, observed);
 
   /**
    * O ATALHO `status='claimed'` PASSA PELA RPC, e não escreve o dono aqui.
@@ -486,13 +643,15 @@ export async function patchConversationHandler(
   }
 
   if (input.status !== undefined) {
-    const observed = await getConversationHandler(supabase, ctx, conversationId);
     const { error: statusError } = await createAdminClient().rpc("fn_service_status", {
       p_org: ctx.organization_id, p_conversation: conversationId, p_status: input.status,
-      p_expected: input.expected_revision ?? observed.service_revision,
+      p_expected: input.expected_revision ?? observed?.service_revision,
     });
-    if (statusError) throw new ApiError(statusError.code === "40001" ? 409 : statusError.code === "P0002" ? 404 : 500,
-      statusError.code === "40001" ? "conflict" : statusError.code === "P0002" ? "not_found" : "internal_error", undefined, ctx.requestId, statusError.message);
+    // PT409: revisão obsoleta (migration 0514). 40001: contato trocou no meio, ou banco anterior à 0514.
+    const conflito = statusError?.code === "PT409" || statusError?.code === "40001";
+    if (statusError) throw new ApiError(conflito ? 409 : statusError.code === "P0002" ? 404 : 500,
+      conflito ? "conflict" : statusError.code === "P0002" ? "not_found" : "internal_error", undefined, ctx.requestId,
+      conflito ? traduzir("O atendimento mudou. Atualize e tente novamente.", ctx.idioma ?? "pt-BR") : statusError.message);
   }
   if (input.tags !== undefined) {
     update.tags = input.tags;

@@ -144,6 +144,16 @@ export type ActivityType =
   | "task_created"
   | "task_completed"
   /**
+   * O PLANO de tarefas (#1752) aplicado ao negócio — a sequência reutilizável
+   * (`organizations.settings.task_plans`) que virou N tarefas de uma vez.
+   *
+   * A linha é DUAS coisas: o "foi aplicado" que quem abre o card lê, e a MARCA
+   * de idempotência que `lib/tarefas/plano.ts` consulta antes de criar — sem
+   * coluna `plan_id` em `crm_tasks` (migration), esta é a única identidade
+   * exata de "este plano já rodou aqui" que o banco guarda.
+   */
+  | "task_plan_applied"
+  /**
    * DOIS CADASTROS DA MESMA PESSOA VIRARAM UM. Emitido por
    * `fn_mesclar_contatos` (migration 0215) em cada negócio que o contato
    * vencedor passou a ter — inclusive nos que ELE não tinha e herdou do
@@ -161,8 +171,8 @@ export type ActivityType =
   /**
    * O negócio nasceu da TROCA DE FUNIL (`POST /api/v1/leads/[id]/clone`).
    *
-   * ⚠️ Não é `lead_created`: aquele rótulo diz "Entrou pelo WhatsApp", e este
-   * negócio não entrou por canal nenhum — ele veio de outro funil, e é isso que
+   * ⚠️ Não é `lead_created`: aquele diz "Entrou no funil" pela primeira
+   * mensagem de um canal, e este negócio não entrou por canal nenhum — ele veio de outro funil, e é isso que
    * quem abre o card no destino precisa ler. O outro lado da troca é a
    * `demand_closed` da origem, com a razão "Levado para o funil X".
    */
@@ -180,10 +190,52 @@ export type ActivityType =
    * retorno veio" seria indistinguível de "o retorno está a caminho" — e é
    * justamente no silêncio que a demanda morre. O PORQUÊ vai no `reason`.
    */
-  | "proposal_followup_skipped";
+  | "proposal_followup_skipped"
+  /**
+   * O CONTATO VIROU PESSOAL / DEIXOU DE SER PESSOAL (spec 21).
+   *
+   * Tipos próprios, e não `note`, porque quem decide o que some da vista é um
+   * FILTRO que só enxerga `new.type`: sem tipo próprio, marcar não teria como
+   * pendurar a prova na timeline do negócio — e sem negócio aberto não há linha
+   * possível (`lead_id` é NOT NULL), só auditoria (D6).
+   */
+  | "contact_marked_personal"
+  | "contact_unmarked_personal"
+  /**
+   * O TELEFONE ENTROU SOZINHO NA FICHA (#2593).
+   *
+   * A exceção da spec 17 §4b — o dado ouvido é proposto, não gravado — só vale
+   * para o telefone de um cadastro SEM número, e só com a opção da organização
+   * ligada (`organizations.settings.crm.telefone_de_ficha_vazia`). Sem esta
+   * linha, o número apareceria no cadastro e o ÚNICO registro seria a auditoria
+   * (`contact.field_auto_applied`), que não tem tela: quem opera lê a timeline,
+   * e "isso entrou sozinho" é exatamente o que ele precisa saber para não
+   * achar que alguém digitou.
+   *
+   * Emitida por `registrarTelefoneAplicadoNaTimeline` — junto e não dentro do
+   * UPDATE do telefone, porque a linha é rastro: falhar nela não pode desfazer
+   * a escrita que ela descreve.
+   */
+  | "contact_field_auto_applied"
+  /**
+   * O DOCUMENTO ENTROU NO CARD (#3316) — o anexo (PDF, imagem) registrado em
+   * `crm_lead_attachments` pela rota de anexos do negócio.
+   *
+   * Sem esta linha, o documento apareceria no card e sumiria da linha do tempo:
+   * quem abre o negócio dias depois não vê QUANDO o voucher chegou, nem que era
+   * aquele arquivo que sustentava a proposta de campo lida por IA. É a memória
+   * do porquê daquela fila de revisão.
+   *
+   * O payload NÃO leva o conteúdo nem o texto do documento: chave do campo,
+   * nome do arquivo, tipo. A leitura da IA não entra no vocabulário porque a
+   * própria fila é a memória dela, com trecho e decisão por proposta.
+   */
+  | "document_attached"
+  | "cold_call_result";
 
 export const ACTIVITY_LABELS: Record<ActivityType, string> = {
-  lead_created: "Entrou pelo WhatsApp",
+  cold_call_result: "Ligação de cold call",
+  lead_created: "Entrou no funil",
   stage_changed: "Mudou de estágio",
   agent_move_corrected: "Correção do que o assistente tinha feito",
   note: "Anotação",
@@ -275,6 +327,7 @@ export const ACTIVITY_LABELS: Record<ActivityType, string> = {
   voice_call_unanswered: "Chamada de voz sem resposta",
   task_created: "Tarefa combinada",
   task_completed: "Tarefa concluída",
+  task_plan_applied: "Plano de tarefas aplicado",
   // Rótulo com OBJETO e sem jargão de banco: "Mesclado" sozinho é palavra de
   // engenheiro. O que aconteceu, para quem lê a timeline do negócio, é que dois
   // cadastros da mesma pessoa viraram um — e é por isso que este negócio pode
@@ -288,6 +341,18 @@ export const ACTIVITY_LABELS: Record<ActivityType, string> = {
   proposal_expired: "Proposta venceu sem decisão",
   proposal_value_changed: "Valor do negócio atualizado pela proposta",
   proposal_followup_skipped: "Follow-up automático não agendado",
+  // Rótulos com o veredito, nunca o mecanismo: quem lê a timeline quer saber
+  // que o contato saiu da operação (ou voltou), não o nome da coluna.
+  contact_marked_personal: "Marcado como pessoal",
+  contact_unmarked_personal: "Desmarcado como pessoal",
+  // Rótulo que diz DUAS coisas de uma vez: que entrou sozinho (e não por
+  // digitação de alguém) e de onde veio. Só assim quem lê a linha do tempo não
+  // vai procurar quem foi que digitou o número.
+  contact_field_auto_applied: "Telefone informado pelo cliente aplicado automaticamente",
+  // Rótulo com objeto, como o resto ("Documento anexado", não "Anexou"): o que
+  // quem lê a timeline do negócio precisa saber é que um documento entrou; qual
+  // campo e qual arquivo saem do payload (`field_key`/`file_name`).
+  document_attached: "Documento anexado ao negócio",
 };
 
 /** Quando o tipo é legado/desconhecido, a linha ainda é honesta — sem jargão. */
@@ -372,6 +437,9 @@ const NOME_DO_CAMPO: Record<string, string> = {
   title: "o título",
   description: "a descrição",
   value_cents: "o valor",
+  recurring_value_cents: "o valor recorrente",
+  recurring_period: "a periodicidade",
+  recurring_months: "a duração",
   currency: "a moeda",
   owner_user_id: "o responsável",
   owner_agent_id: "o agente responsável",

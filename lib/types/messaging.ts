@@ -63,6 +63,17 @@ export interface Conversation {
    * por resposta no celular (`comandoDaConversa` escolhe o motivo da tela).
    */
   last_handoff_reason?: string | null;
+  /**
+   * A conversa está marcada como EXEMPLO para o agente aprender (#3006) — o
+   * opt-in de LGPD (L-08) que a rota `POST .../usable-for-rag` liga e que o
+   * cron `kb-conversations-batch` consome.
+   *
+   * Opcional de propósito, como `comando_da_conversa`: uma resposta em cache de
+   * antes deste campo entrar no `SELECT_COLS` da lista não o tem. AUSENTE é
+   * "não afirmo que está marcada", nunca "não está" — e o selo da lista só
+   * aparece com `true`, porque afirmar o contrário seria pior.
+   */
+  usable_for_rag?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -92,6 +103,13 @@ export interface Message {
   media_mime: string | null;
   media_size_bytes: number | null;
   media_storage_path: string | null;
+  /** Transcrição de mídia derivada (áudio→texto). Só disponível quando
+   * `media_derived_status === 'ready'`. A realimentação chega aqui vinda das
+   * colunas `messages.media_derived_text/status` (#2057). Elas já eram usadas
+   * pela IA; agora o balão da inbox também as lê para o atendente que não
+   * consegue ouvir. */
+  media_derived_text?: string | null;
+  media_derived_status?: string | null;
   // Espelha o CHECK do banco (messages_sent_via_check): 'crm', 'external_device',
   // 'automation', 'ai', 'user', 'system'. O tipo listava só três e o TypeScript
   // aceitava os demais só porque o dado vem do Supabase sem cast — a tela então
@@ -120,6 +138,20 @@ export interface Message {
   /** A mensagem que esta responde (citação). `null` = envio solto. */
   reply_to_message_id: string | null;
   created_at: string;
+  /**
+   * Última escrita na linha (trigger `trg_messages_updated_at`). É o relógio do
+   * reenvio (`lib/messaging/reenvio.ts`): linha `queued` parada há muito pode
+   * ter perdido o processo que a enviava. Opcional porque linhas montadas fora
+   * do `MSG_COLS` (otimistas antigas, fixtures) não o trazem.
+   */
+  updated_at?: string;
+  /**
+   * O modelo aprovado pelo qual a mensagem saiu (`type = 'template'`). Opcionais:
+   * ausentes em linhas montadas fora do `MSG_COLS`. O balão os usa para dizer
+   * que a mensagem foi por modelo; os botões moram em `metadata.template_buttons`.
+   */
+  template_name?: string | null;
+  template_language?: string | null;
 }
 
 /** Nota interna de conversa (Onda 5.2) — nunca vai ao cliente, tabela separada de messages. */
@@ -142,16 +174,34 @@ export interface Note {
   media_storage_path: string | null;
   media_mime: string | null;
   media_size_bytes: number | null;
+  /**
+   * O rastro da retenção por idade (#3756): quando o prazo da organização apaga
+   * o anexo, o passo 2c de `fn_enfileirar_midia_vencida` zera os três ponteiros
+   * acima e grava o "quando" e os "dias" aqui. `null` = nada foi apagado — é o
+   * que separa uma nota que perdeu o anexo de uma nota que nunca teve, e é o
+   * que o card lê para mostrar o aviso no lugar do arquivo.
+   *
+   * A redação por LGPD NÃO grava esta marca de propósito: ali o anexo não saiu
+   * por política de retenção, e o aviso fala de prazo.
+   */
+  media_expired_at: string | null;
+  media_retention_days: number | null;
 }
 
 /**
- * Mapeia ack do WAHA (0..3) para o status canônico em messages.status.
- * 0=pending/sent server-side, 1=server-confirmed, 2=delivered (device), 3=read.
+ * Mapeia o ack do WAHA para o status de `messages.status` quando o aviso MUDA o
+ * status. Valores do WAHA: -1 erro, 0 pendente, 1 servidor, 2 aparelho
+ * (entregue), 3 lido, 4 ouvido.
+ *
+ * Devolve `null` para "não muda o status": 0 (pendente, ainda não é "enviada"),
+ * -1 (erro — quem trata é `handleAck`, que grava `failed`, nunca `sending`) e
+ * ausente. Não há mais um `"sending"` de reserva: um aviso que não sabe o que
+ * dizer não pode fazer a mensagem regredir.
  */
-export function ackToStatus(ack: number | null | undefined): Message["status"] {
-  if (ack == null) return "sent";
+export function ackToStatus(ack: number | null | undefined): Message["status"] | null {
+  if (ack == null) return null;
   if (ack >= 3) return "read";
   if (ack >= 2) return "delivered";
   if (ack >= 1) return "sent";
-  return "sending";
+  return null;
 }

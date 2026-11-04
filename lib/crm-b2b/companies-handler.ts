@@ -3,15 +3,19 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { ApiError } from "@/lib/api/types";
 import type { HandlerCtx } from "@/lib/api/handlers/types";
 import { audit } from "@/lib/audit";
-import { enrichCompanyFromBrasilApi } from "@/lib/crm-b2b/enrich";
-import { formatCnpj, normalizeCnpj } from "@/lib/crm-b2b/normalize";
 import {
-  companyCreateSchema,
-  companyPatchSchema,
-  type CompanyCreate,
-} from "@/lib/crm-b2b/schemas";
+  createBrasilApiClient,
+  mapBrasilApiToCompanyFields,
+  type BrasilApiResult,
+} from "@/lib/brasil-api/client";
+import { enrichCompanyFromBrasilApi } from "@/lib/crm-b2b/enrich";
+import { formatCnpj, MENSAGEM_DE_CNPJ_INVALIDO, normalizeCnpj } from "@/lib/crm-b2b/normalize";
+import { companyCreateSchema, companyPatchSchema, type CompanyCreate } from "@/lib/crm-b2b/schemas";
 
 type SB = SupabaseClient;
+
+/** Cliente de consulta injetável — permite dublar a rota sem rede nem token. */
+type LookupClient = { lookupCnpj(normalizedCnpj: string): Promise<BrasilApiResult> };
 
 const SELECT =
   "id, organization_id, legal_name, trade_name, cnpj, normalized_cnpj, registration_status, legal_nature, company_size, share_capital, opened_at, main_cnae_code, main_cnae_description, secondary_cnaes, street, number, complement, district, city, state, zip_code, email, phone, enrichment_status, enriched_at, enrichment_error, created_by, created_at, updated_at";
@@ -42,7 +46,9 @@ export async function listCompaniesHandler(
 
   if (opts.search?.trim()) {
     const s = `%${opts.search.trim()}%`;
-    q = q.or(`trade_name.ilike.${s},legal_name.ilike.${s},cnpj.ilike.${s},normalized_cnpj.ilike.${s}`);
+    q = q.or(
+      `trade_name.ilike.${s},legal_name.ilike.${s},cnpj.ilike.${s},normalized_cnpj.ilike.${s}`,
+    );
   }
 
   const { data, error } = await q;
@@ -95,7 +101,7 @@ export async function createCompanyHandler(
 ) {
   const body: CompanyCreate = companyCreateSchema.parse(raw);
   const normalized = body.cnpj ? normalizeCnpj(body.cnpj) : null;
-  if (body.cnpj && !normalized) err(ctx, 422, "validation_failed", "CNPJ inválido.");
+  if (body.cnpj && !normalized) err(ctx, 422, "validation_failed", MENSAGEM_DE_CNPJ_INVALIDO);
 
   if (normalized) {
     const { data: dup } = await supabase
@@ -167,7 +173,7 @@ export async function patchCompanyHandler(
   }
   if (body.cnpj !== undefined) {
     const normalized = body.cnpj ? normalizeCnpj(body.cnpj) : null;
-    if (body.cnpj && !normalized) err(ctx, 422, "validation_failed", "CNPJ inválido.");
+    if (body.cnpj && !normalized) err(ctx, 422, "validation_failed", MENSAGEM_DE_CNPJ_INVALIDO);
     patch.cnpj = normalized ? formatCnpj(normalized) : null;
     patch.normalized_cnpj = normalized;
   }
@@ -222,4 +228,104 @@ export async function enrichCompanyHandler(
     metadata: { status: result.status },
   });
   return getCompanyHandler(supabase, ctx, id);
+}
+
+/**
+ * Consulta um CNPJ na BrasilAPI antes de criar (fluxo B2B: consulta → revisão →
+ * criação). NÃO grava nada; devolve os campos públicos para a tela preencher.
+ * O cliente é injetável para o teste dublar a rede.
+ */
+export async function lookupCompanyCnpjHandler(
+  supabase: SB,
+  ctx: HandlerCtx,
+  raw: { cnpj?: unknown },
+  client: LookupClient = createBrasilApiClient(),
+) {
+  const cnpj = typeof raw?.cnpj === "string" ? raw.cnpj.trim() : "";
+  const normalized = normalizeCnpj(cnpj);
+  if (!normalized) err(ctx, 422, "validation_failed", MENSAGEM_DE_CNPJ_INVALIDO);
+
+  const { data: dup } = await supabase
+    .from("companies")
+    .select("id")
+    .eq("organization_id", ctx.organization_id)
+    .eq("normalized_cnpj", normalized)
+    .maybeSingle();
+
+  const result = await client.lookupCnpj(normalized);
+  if (!result.ok) {
+    // Recusa (403/429) ou falha da BrasilAPI não é "não encontrado", e a tela
+    // precisa distinguir. A dica NÃO afirma causa: a permanente (o User-Agent
+    // padrão do Node) foi consertada no cliente, e o que sobrar não foi medido.
+    const status = result.code === "not_found" ? 404 : 502;
+    const dica =
+      result.status === 403 || result.status === 429
+        ? `A BrasilAPI recusou a consulta (HTTP ${result.status}). Tente de novo em alguns minutos; se persistir, avise o suporte.`
+        : undefined;
+    err(ctx, status, result.code, result.message, dica ? { dica } : undefined);
+  }
+
+  return {
+    cnpj: formatCnpj(normalized),
+    normalized_cnpj: normalized,
+    already_registered: Boolean(dup),
+    fields: mapBrasilApiToCompanyFields(result.data),
+  };
+}
+
+export async function deleteCompanyHandler(
+  supabase: SB,
+  ctx: HandlerCtx,
+  actorUserId: string,
+  id: string,
+) {
+  const { data: existing, error: loadErr } = await supabase
+    .from("companies")
+    .select("id, trade_name, legal_name")
+    .eq("organization_id", ctx.organization_id)
+    .eq("id", id)
+    .maybeSingle();
+  if (loadErr) err(ctx, 500, "internal_error", loadErr.message);
+  if (!existing) err(ctx, 404, "not_found", "Empresa não encontrada.");
+
+  // company_people aponta para companies com ON DELETE CASCADE: o banco nunca
+  // devolve 23503 aqui, ele apaga os vínculos (cargo, decisor) em silêncio.
+  // Contar antes é o que recusa a exclusão quando há pessoas vinculadas.
+  const { count: vinculos, error: countErr } = await supabase
+    .from("company_people")
+    .select("id", { count: "exact", head: true })
+    .eq("organization_id", ctx.organization_id)
+    .eq("company_id", id);
+  if (countErr) err(ctx, 500, "internal_error", countErr.message);
+  if (vinculos && vinculos > 0)
+    err(
+      ctx,
+      409,
+      "conflict",
+      `Não é possível excluir: ${vinculos} pessoa(s) vinculada(s) a esta empresa. Remova os vínculos antes.`,
+      { linked_people: vinculos },
+    );
+
+  const { error } = await supabase
+    .from("companies")
+    .delete()
+    .eq("organization_id", ctx.organization_id)
+    .eq("id", id);
+  if (error) {
+    // Rede para FK futura sem cascade (23503): informar o motivo.
+    if (error.code === "23503")
+      err(ctx, 409, "conflict", "Não é possível excluir: há vínculos ativos com esta empresa.");
+    err(ctx, 500, "internal_error", error.message);
+  }
+
+  await audit({
+    organizationId: ctx.organization_id,
+    actorUserId,
+    action: "companies.deleted",
+    resourceType: "companies",
+    resourceId: id,
+    requestId: ctx.requestId,
+  });
+
+  return { deleted: true, id, legal_name: existing.legal_name ?? existing.trade_name ?? null };
 }

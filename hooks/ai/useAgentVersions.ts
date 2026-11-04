@@ -23,6 +23,8 @@ export interface AgentVersionRow {
   history_token_window: number;
   handoff_keywords: string[];
   handoff_tool_enabled: boolean;
+  /** Passagem por ASSUNTO JURÍDICO ligada nesta versão (#2156). Padrão: `true`. */
+  handoff_legal_enabled: boolean;
   proposal_ai_draft_enabled: boolean;
   cases_enabled: boolean;
   operator_enabled: boolean;
@@ -33,12 +35,15 @@ export interface AgentVersionRow {
   split_messages: boolean;
   split_max_chars: number;
   inbound_debounce_ms: number | null;
+  reply_min_interval_ms: number | null;
   followup: {
     enabled: boolean;
     flow_pointer_ids: string[];
     callback_enabled?: boolean;
     send_window?: { start: string; end: string; weekdays: number[] } | null;
   };
+  voz_enabled: boolean;
+  voz_quando: "nunca" | "espelhar" | "sempre";
   status: "draft" | "published" | "superseded" | "archived";
   published_at: string | null;
   superseded_at: string | null;

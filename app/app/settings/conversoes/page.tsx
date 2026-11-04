@@ -59,16 +59,32 @@ import { lerEstadoDaCaptura } from "@/lib/plataformas-de-anuncio/landing-config"
 import { createAdminClient } from "@/lib/supabase/admin";
 
 import { ReprocessarConversao } from "./_reprocessar";
+import { LinkDoNegocio } from "./_linkDoNegocio";
 import { HistoricoDeEnvios } from "./_historico";
+import { HistoricoDeCliques } from "./_historicoCliques";
+import { lerHistoricoDeCliques } from "@/lib/conversoes/historico-de-cliques";
 import { DiagnosticoGoogle } from "./_diagnostico";
-import { lerDiagnosticoGoogle, lerFiltros, lerHistorico } from "@/lib/conversoes/historico";
+import {
+  lerDiagnosticoGoogle,
+  lerFiltros,
+  lerHistorico,
+  rotuloDoEvento,
+} from "@/lib/conversoes/historico";
 import { FormularioDeCapturaDeUtm } from "./_formCapturaDeUtm";
 import { FormularioDeConversoes } from "./_form";
 import { FormularioDeConversoesGoogle } from "./_formGoogle";
+import { IdentidadeDaConversao } from "./_identidadeDaMeta";
 import { VendaPeloCanal } from "./_vendaPeloCanal";
+import { OrigemPorHorario } from "./_origemPorHorario";
+import { LeadSubmittedCausal } from "./_leadSubmittedCausal";
+import { ativacaoLeadMeta } from "@/lib/conversoes/ativacao-lead-meta";
 import { vendaPeloCanalLigada } from "@/lib/conversoes/venda-pelo-canal";
+import { origemPorHorarioLigada } from "@/lib/leads/origem-por-horario";
+import { identidadeDaMeta } from "@/lib/plataformas-de-anuncio/meta/identidade";
 import { RegrasDeConversaoGoogle, type EtapaAberta } from "./_regrasGoogle";
 import { listarRegrasGoogle } from "@/lib/conversoes/regras-google";
+import { RegrasDeConversaoMeta } from "./_regrasMeta";
+import { listarRegrasMeta } from "@/lib/conversoes/regras-meta";
 
 export const metadata = { title: "Conversões" };
 export const dynamic = "force-dynamic";
@@ -119,6 +135,7 @@ export default async function ConversoesPage({
     capturaGoogle,
     etapas,
     regrasGoogle,
+    regrasMeta,
   ] = await Promise.all([
     lerEstadoDaConexao(admin, activeOrg.orgId),
     lerPendencias(admin, activeOrg.orgId),
@@ -129,7 +146,11 @@ export default async function ConversoesPage({
     // aqui não pode derrubar a tela inteira: sem sugestão, a pessoa digita.
     listSelectableChannels(admin, activeOrg.orgId).catch(() => []),
     // O `slug` é o `[org]` da rota pública, e não está no `ActiveOrg`.
-    admin.from("organizations").select("slug, settings").eq("id", activeOrg.orgId).maybeSingle(),
+    admin
+      .from("organizations")
+      .select("slug, settings, meta_lead_birth_enabled_at")
+      .eq("id", activeOrg.orgId)
+      .maybeSingle(),
     lerEstadoDaCaptura(admin, "google_ads_landing_pages", activeOrg.orgId),
     admin
       .from("crm_stages")
@@ -140,9 +161,31 @@ export default async function ConversoesPage({
       .order("position"),
     // Falha na leitura das regras não derruba a tela: o editor some e o resto fica.
     listarRegrasGoogle(admin, activeOrg.orgId).catch(() => null),
+    listarRegrasMeta(admin, activeOrg.orgId).catch(() => null),
   ]);
-  const linhaDaOrganizacao = organizacao.data as { slug: string | null; settings?: unknown } | null;
+  // O nome que a pessoa reconhece para cada evento de etapa, das duas
+  // plataformas — o Histórico e as pendências leem daqui.
+  const nomePorEtapa = new Map((etapas.data ?? []).map((e) => [e.id, e.name]));
+  const rotulosDeEtapa = [
+    ...(regrasGoogle ?? []).map((r) => ({ eventName: r.eventName, label: r.label })),
+    ...(regrasMeta ?? []).map((r) => ({
+      eventName: r.eventName,
+      label: nomePorEtapa.get(r.stageId) ?? "",
+    })),
+  ];
+  const linhaDaOrganizacao = organizacao.data as unknown as {
+    slug: string | null;
+    settings?: unknown;
+    meta_lead_birth_enabled_at?: unknown;
+  } | null;
   const slug = linhaDaOrganizacao?.slug ?? null;
+  // Página / WABA gravadas pela tela (#2098) — a MESMA leitura que a credencial
+  // faz no caminho do envio, para a tela e o envio nunca divergirem.
+  const identidadeMeta = identidadeDaMeta(linhaDaOrganizacao?.settings);
+  // As regras de etapa da Meta têm dois destinos: a conexão direta OU a ponte
+  // do canal da conversa (a mesma chave da venda). Escondê-las sem a conexão
+  // direta deixava quem só tem o canal com regras que enviam e que ninguém vê.
+  const vendaPeloCanal = vendaPeloCanalLigada(linhaDaOrganizacao?.settings);
   // Etapas abertas agrupadas por funil, na ordem do funil; a primeira de cada
   // funil é onde o lead nasce (a sugestão "Novo lead" do recomendado).
   const vistosOsFunis = new Set<string>();
@@ -173,6 +216,10 @@ export default async function ConversoesPage({
   const historico =
     aba === "historico"
       ? await lerHistorico(admin, activeOrg.orgId, filtrosDoHistorico).catch(() => null)
+      : null;
+  const historicoCliques =
+    aba === "historico"
+      ? await lerHistoricoDeCliques(admin, activeOrg.orgId).catch(() => null)
       : null;
   const diagnostico =
     aba === "diagnostico"
@@ -248,7 +295,15 @@ export default async function ConversoesPage({
 
       {aba === "links" ? (
         links ? (
-          <LinksRastreaveis links={links} metricas={metricas} idioma={idioma} />
+          <div className="flex flex-col gap-4">
+            {/* A dedução só vale para link rastreável: é o clique dele que fica sem dono. */}
+            <OrigemPorHorario
+              key={`${activeOrg.orgId}:${origemPorHorarioLigada(linhaDaOrganizacao?.settings)}`}
+              ligada={origemPorHorarioLigada(linhaDaOrganizacao?.settings)}
+              idioma={idioma}
+            />
+            <LinksRastreaveis links={links} metricas={metricas} idioma={idioma} />
+          </div>
         ) : (
           <p role="alert">
             {t("Não foi possível ler os links. Atualize a página para tentar novamente.")}
@@ -256,13 +311,24 @@ export default async function ConversoesPage({
         )
       ) : aba === "historico" ? (
         historico ? (
-          <HistoricoDeEnvios
-            linhas={historico.linhas}
-            total={historico.total}
-            filtros={filtrosDoHistorico}
-            regras={regrasGoogle ?? []}
-            idioma={idioma}
-          />
+          <div className="flex flex-col gap-8">
+            <HistoricoDeEnvios
+              linhas={historico.linhas}
+              total={historico.total}
+              filtros={filtrosDoHistorico}
+              regras={rotulosDeEtapa}
+              idioma={idioma}
+            />
+            {historicoCliques ? (
+              <HistoricoDeCliques linhas={historicoCliques} idioma={idioma} />
+            ) : (
+              <p role="alert" className="rounded-md border p-4 text-sm">
+                {t(
+                  "Não consegui ler o histórico de cliques agora. Atualize a página em instantes.",
+                )}
+              </p>
+            )}
+          </div>
         ) : (
           <p className="rounded-md border p-4 text-sm">
             {t("Não consegui ler o histórico agora. Atualize a página em instantes.")}
@@ -309,10 +375,35 @@ export default async function ConversoesPage({
           )}
 
           <FormularioDeConversoes estado={estado} idioma={idioma} />
-          <VendaPeloCanal
-            ligada={vendaPeloCanalLigada(linhaDaOrganizacao?.settings)}
-            idioma={idioma}
-          />
+          {organizacao.error || !linhaDaOrganizacao ? (
+            <p role="alert" className="rounded-md border border-destructive/40 p-4 text-sm">
+              {t(
+                "Não foi possível ler a ativação de LeadSubmitted. Atualize a página para tentar novamente.",
+              )}
+            </p>
+          ) : (
+            <LeadSubmittedCausal
+              key={`${activeOrg.orgId}:${ativacaoLeadMeta(linhaDaOrganizacao.meta_lead_birth_enabled_at) !== null}`}
+              ligado={ativacaoLeadMeta(linhaDaOrganizacao.meta_lead_birth_enabled_at) !== null}
+              idioma={idioma}
+            />
+          )}
+          <VendaPeloCanal ligada={vendaPeloCanal} idioma={idioma} />
+          {estado.conectada && (
+            <IdentidadeDaConversao
+              pageId={identidadeMeta.pageId}
+              whatsappBusinessAccountId={identidadeMeta.whatsappBusinessAccountId}
+              idioma={idioma}
+            />
+          )}
+          {(estado.conectada || vendaPeloCanal) && !etapas.error && regrasMeta && (
+            <RegrasDeConversaoMeta
+              etapas={etapasAbertas}
+              regras={regrasMeta}
+              idioma={idioma}
+              conexaoDireta={estado.conectada}
+            />
+          )}
           <FormularioDeConversoesGoogle
             estado={estadoGoogle}
             idioma={idioma}
@@ -387,15 +478,19 @@ export default async function ConversoesPage({
                     {pendencias.map((p) => (
                       <tr key={`${p.leadId}:${p.evento}`} className="border-t align-top">
                         <td className="p-3">
-                          <a
-                            className="underline underline-offset-2"
-                            href={`/app/kanban?lead=${p.leadId}`}
-                          >
+                          <LinkDoNegocio className="underline underline-offset-2" leadId={p.leadId}>
                             {p.tituloDoLead ?? t("(sem título)")}
-                          </a>
+                          </LinkDoNegocio>
                         </td>
                         <td className="p-3">
-                          {t(p.evento === "QualifiedLead" ? "Lead qualificado" : "Compra")}
+                          {p.evento.startsWith("MetaEtapa:")
+                            ? [
+                                t("Entrada na etapa"),
+                                rotulosDeEtapa.find((r) => r.eventName === p.evento)?.label,
+                              ]
+                                .filter(Boolean)
+                                .join(" ")
+                            : t(rotuloDoEvento(p.evento, rotulosDeEtapa))}
                         </td>
                         <td className="p-3">
                           {p.plataforma === "meta_ads"

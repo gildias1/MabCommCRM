@@ -45,11 +45,24 @@ export interface ConferenciaDeSaida {
   oQueProtege: string;
   /**
    * `null` = não se desliga, e o texto diz por quê.
-   * Objeto = há escolha real, e ela custa dinheiro — o custo vai na tela.
+   * Objeto = há escolha real, e o que ela custa vai na tela.
+   *
+   * `consultaModelo` separa as duas razões de haver escolha. As camadas que consultam um
+   * modelo custam dinheiro por mensagem, e o padrão delas vem do servidor. A afirmação
+   * clínica não custa nada: é escolha porque só serve a negócio de saúde, e o padrão
+   * dela é desligado, sem servidor nenhum. Sem este campo, a tela diria "o modelo usado
+   * se escolhe em Provedores" e "vem da configuração do servidor" sobre uma camada que
+   * não tem modelo nem configuração de servidor.
    */
-  escolha: { custo: string } | null;
+  escolha: { custo: string; consultaModelo: boolean } | null;
   /** Por que não se desliga. Vazio quando há escolha. */
   porQueNaoSeDesliga: string;
+  /**
+   * Sem interruptor NESTA tela, mas com escolha em outra (a conferência de fato
+   * liga no cartão do Jev). Toma o lugar do "Isto não se desliga.", que ali
+   * seria mentira.
+   */
+  escolhaEmOutraTela?: string;
   /**
    * A chave da camada em `org_guardrail_layers`, quando há escolha.
    *
@@ -59,7 +72,7 @@ export interface ConferenciaDeSaida {
    * a tela deixa de encontrar o estado e mostra "carregando…" para sempre —
    * aconteceu ao escrever isto, e o teste de componente pegou.
    */
-  camada: "promessa_semantica" | "jailbreak" | null;
+  camada: "promessa_semantica" | "jailbreak" | "afirmacao_clinica" | "restricao_comercial" | null;
 }
 
 /**
@@ -126,13 +139,36 @@ export const CONFERENCIAS_DE_SAIDA: readonly ConferenciaDeSaida[] = [
      camada: null,
   },
   {
+    nome: "concessao_sem_lastro",
+    rotulo: "Não confirmar valor que só o cliente citou",
+    oQueProtege:
+      "Barra a resposta que confirma preço, parcela ou percentual que só aparece no que o cliente " +
+      "escreveu, e em nada que a empresa enviou ou cadastrou. O assistente refaz sem esse número.",
+    escolha: null,
+    porQueNaoSeDesliga:
+      "O que o cliente escreve não é registro da sua empresa: confirmar um valor que só ele trouxe " +
+      "obriga o negócio a uma condição que ninguém da equipe deu. Regra fixa, sem custo.",
+    camada: null,
+  },
+  {
     nome: "semantic_promise",
     rotulo: "Conferir promessas em texto livre",
     oQueProtege:
       "Uma segunda leitura, feita por um modelo, para pegar a promessa escrita de um jeito que a regra fixa não reconhece.",
-    escolha: { custo: "+1 consulta ao modelo por mensagem enviada" },
+    escolha: { custo: "+1 consulta ao modelo por mensagem enviada", consultaModelo: true },
     porQueNaoSeDesliga: "",
     camada: "promessa_semantica",
+  },
+  {
+    nome: "factual_claim",
+    rotulo: "Conferir afirmações de fato na resposta",
+    oQueProtege:
+      "Confere se o que o assistente afirma sobre o negócio (horário, preço, endereço) está no material que ele consultou para responder.",
+    escolha: null,
+    escolhaEmOutraTela: "Liga-se no cartão do Jev, em Provedores de IA.",
+    porQueNaoSeDesliga:
+      "Vem desligada. Nesta versão ela só anota o que encontrou e não barra nenhuma mensagem; ligada, custa +1 consulta ao Jev por resposta.",
+    camada: null,
   },
   {
     nome: "case_promise",
@@ -155,6 +191,37 @@ export const CONFERENCIAS_DE_SAIDA: readonly ConferenciaDeSaida[] = [
      camada: null,
   },
   {
+    nome: "clinical_claim",
+    rotulo: "Não fazer afirmação clínica",
+    oQueProtege:
+      "Barra a mensagem em que o assistente diz o que a pessoa tem, indica remédio ou dose, " +
+      "garante resultado ou afirma que uma lesão é câncer.",
+    escolha: {
+      custo:
+        "Não custa nada e reconhece frases em português e espanhol. Só serve para " +
+        "saúde: em outros negócios pode barrar frases normais, como \"passe o creme hidratante\".",
+      consultaModelo: false,
+    },
+    porQueNaoSeDesliga: "",
+    camada: "afirmacao_clinica",
+  },
+  {
+    nome: "commercial_restriction",
+    rotulo: "Deixar valores e negociação com a equipe",
+    oQueProtege:
+      "Quando ligada, o assistente não fala de preço, desconto, parcelamento nem forma de " +
+      "pagamento: o pedido vai direto para uma pessoa da equipe, o cliente é avisado, e a " +
+      "resposta do assistente que tocar nesses assuntos não sai.",
+    escolha: {
+      custo:
+        "Não custa nada e reconhece frases em português e espanhol. Vale para a organização " +
+        "inteira, e pode mandar à equipe uma pergunta que não era sobre preço.",
+      consultaModelo: false,
+    },
+    porQueNaoSeDesliga: "",
+    camada: "restricao_comercial",
+  },
+  {
     nome: "agenda_stall",
     rotulo: "Não prometer checar a agenda sem checar de verdade",
     oQueProtege:
@@ -164,6 +231,31 @@ export const CONFERENCIAS_DE_SAIDA: readonly ConferenciaDeSaida[] = [
     porQueNaoSeDesliga:
       "É a mesma promessa vazia do 'vou pedir pro responsável', só que sobre agenda: o cliente " +
       "fica esperando uma confirmação que nunca foi checada. Regra fixa, sem custo.",
+    camada: null,
+  },
+  {
+    nome: "horario_da_agenda",
+    rotulo: "Só oferecer horário que a agenda devolveu",
+    oQueProtege:
+      "Barra a resposta que cita dia e horário que a busca da agenda não devolveu nesta " +
+      'resposta, e o "está agendado" quando a marcação não foi gravada. O assistente refaz ' +
+      "com a agenda; se insistir, passa a conversa para a equipe.",
+    escolha: null,
+    porQueNaoSeDesliga:
+      "Horário inventado vira consulta marcada em cima de outra, e confirmação sem marcação " +
+      "vira paciente esperando uma consulta que não existe. Regra fixa, sem custo.",
+    camada: null,
+  },
+  {
+    nome: "registro_sem_efeito",
+    rotulo: "Conferir a escrita antes de afirmar registro",
+    oQueProtege:
+      "Recusa a confirmação de registro quando a ferramenta não confirmou nenhuma escrita " +
+      "neste turno. O controle ainda não identifica a qual item cada escrita se refere.",
+    escolha: null,
+    porQueNaoSeDesliga:
+      "É a mesma promessa vazia do 'vou pedir pro responsável': o cliente fica esperando um " +
+      "contato que nunca acontece. Regra fixa, sem custo.",
     camada: null,
   },
   {
@@ -188,7 +280,7 @@ export const CONFERENCIA_DE_ENTRADA: ConferenciaDeSaida = {
   rotulo: "Detectar tentativa de manipular o assistente",
   oQueProtege:
     "Lê a mensagem que chega e reconhece quem está tentando fazer o assistente ignorar as suas instruções.",
-  escolha: { custo: "+1 consulta ao modelo por mensagem recebida" },
+  escolha: { custo: "+1 consulta ao modelo por mensagem recebida", consultaModelo: true },
   porQueNaoSeDesliga: "",
   camada: "jailbreak",
 };

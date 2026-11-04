@@ -76,13 +76,28 @@ export const RESUME_GRACE_MS = 30 * 60_000;
 export const LIVE_STATUSES: readonly EnrollmentStatus[] = ["active", "waiting_reply", "paused_handoff"];
 
 /**
- * O opt-out alcança o dormente também.
+ * O opt-out alcança o dormente também — e a pausa manual.
  *
  * STOP e LGPD são hard stop: não admitem exceção de status, e uma espera de 28
  * dias que sobrevivesse ao "pare de me mandar mensagem" voltaria a falar com
  * quem pediu silêncio — um mês depois, quando ninguém mais lembra por quê.
+ *
+ * `paused_manual` (0145) fica FORA de `LIVE_STATUSES` pelo mesmo motivo do
+ * dormente: a pausa que uma pessoa pôs não reage à mensagem comum — quem a
+ * retoma é quem pausou. Mas o STOP a alcança. Sem isso, a inscrição pausada
+ * sobrevivia ao opt-out: a mensagem não vazava (o `stopGate` relê `is_blocked`
+ * no turno), mas a régua não virava `opted_out`, a métrica não contava o
+ * opt-out, e a inscrição seguia ocupando a vaga única do contato
+ * (`idx_followup_enrollments_one_live`) — todo follow-up legítimo futuro dele
+ * morreria em 23505 sem explicação. A cascata de LGPD já a alcançava
+ * (`lib/lgpd/cascata.ts`); o STOP era o único que não.
  */
-const STATUS_ALCANCADOS_PELO_OPT_OUT: readonly EnrollmentStatus[] = [...LIVE_STATUSES, "dormente", "coletando"];
+const STATUS_ALCANCADOS_PELO_OPT_OUT: readonly EnrollmentStatus[] = [
+  ...LIVE_STATUSES,
+  "dormente",
+  "coletando",
+  "paused_manual",
+];
 
 export interface LiveEnrollmentRef {
   id: string;
@@ -104,6 +119,15 @@ export interface LiveEnrollmentRef {
 export interface ReactivityAdminClient {
   loadConversationContactId(orgId: string, conversationId: string): Promise<string | null>;
   loadContactBlocked(orgId: string, contactId: string): Promise<boolean>;
+  /**
+   * Spec 21 (caminho 4): o inbound de pessoal cancela tudo, como o STOP.
+   *
+   * OPCIONAL de propósito: a interface tem falsos em `tests/unit` e em
+   * `tests/invariants` (congelado) que implementam só o que medem — exigir
+   * quebraria todos. A produção implementa (ver
+   * `createSupabaseReactivityClient`); ausente lê-se como "não é pessoal".
+   */
+  loadContactPersonal?(orgId: string, contactId: string): Promise<boolean>;
   /**
    * `statuses` existe só para o ramo de opt-out, que precisa alcançar o
    * `dormente`. As demais reações usam o default e seguem sem enxergá-lo — em
@@ -149,6 +173,15 @@ export interface ReactivitySummary {
 function parseCancelOnReply(raw: unknown): boolean {
   const parsed = triggerConfigSchema.safeParse(raw);
   if (!parsed.success) return false;
+  // ⚠️ `appointment_no_show` CANCELA MESMO SEM O CAMPO GRAVADO — é o único
+  // gatilho em que a tela não oferece escolha (o interruptor nasce ligado e
+  // travado; ver `TriggerConfigControl.tsx`), e todo fluxo salvo pela tela até a
+  // #3400 está no banco SEM o campo. Persistir `true` só no próximo salvamento
+  // consertaria o futuro e deixaria esses fluxos roteando por cima de quem
+  // acabou de responder. Aqui o ausente significa `true`; `false` DECLARADO
+  // (API, importação, portabilidade) continua respeitado — default não
+  // sequestra configuração.
+  if (parsed.data.kind === "appointment_no_show") return parsed.data.cancel_on_reply ?? true;
   return parsed.data.cancel_on_reply ?? false;
 }
 
@@ -216,15 +249,29 @@ async function cancelAll(
 
 // ---- reação 1: message.received (inbound) ---------------------------------
 
+/**
+ * `semAcordar`: só a recuperação de mensagens de uma queda do número passa isto. A mensagem
+ * é antiga, então ela pode PARAR um fluxo que pede cancelamento na resposta (`cancel_on_reply`),
+ * mas nunca acordar uma espera nem mandar o próximo passo.
+ */
+export type OpcoesDaReatividade = { semAcordar?: boolean };
+
 async function reactToInbound(
   db: ReactivityAdminClient,
   clock: () => Date,
   row: EventRow,
+  opcoes: OpcoesDaReatividade = {},
 ): Promise<ReactivitySummary> {
   const contactId = strOrNull(row.payload.contact_id);
   if (!contactId) return { matched: false, reacted: 0 };
 
   const isBlocked = await db.loadContactBlocked(row.organization_id, contactId);
+  // Contato pessoal (spec 21, caminho 4): trata igual ao bloqueio — cancela
+  // TUDO que está vivo, sem exceção de status. O motivo próprio (`pessoal`,
+  // nunca `stop_keyword`) é o que distingue na auditoria; o `outcome`
+  // reaproveita `opted_out` porque o CHECK da coluna é fechado (mesma decisão
+  // da rota de marcar, etapa 4).
+  const isPersonal = (await db.loadContactPersonal?.(row.organization_id, contactId)) ?? false;
   // Carrega JÁ com o dormente: o ramo de opt-out abaixo precisa alcançá-lo, e
   // uma segunda consulta só para o caso bloqueado pagaria uma ida ao banco em
   // toda mensagem recebida da instalação para servir a minoria.
@@ -233,6 +280,11 @@ async function reactToInbound(
     contactId,
     STATUS_ALCANCADOS_PELO_OPT_OUT,
   );
+
+  if (isPersonal) {
+    const reacted = await cancelAll(db, row.organization_id, row.id, live, "opted_out", "pessoal", "reactivity_personal", clock);
+    return { matched: true, reacted };
+  }
 
   if (isBlocked) {
     // STOP/opt-out (a regex já rodou em lib/waha/ingest.ts e setou is_blocked
@@ -265,6 +317,9 @@ async function reactToInbound(
       continue;
     }
 
+    // Mensagem recuperada de uma queda não ACORDA a espera: acordar faz o fluxo falar agora,
+    // por causa de uma mensagem de horas ou dias atrás. Cancelar (acima) continua valendo.
+    if (opcoes.semAcordar) continue;
     if (await acordarPorInbound(db, clock, row, e)) reacted++;
   }
   // Uma espera por tempo fixo fica `active` com timer. Quando o fluxo declara
@@ -287,6 +342,9 @@ async function reactToInbound(
       continue;
     }
 
+    // Mensagem recuperada de uma queda não ACORDA a espera: acordar faz o fluxo falar agora,
+    // por causa de uma mensagem de horas ou dias atrás. Cancelar (acima) continua valendo.
+    if (opcoes.semAcordar) continue;
     if (await acordarPorInbound(db, clock, row, e)) reacted++;
   }
   return { matched: true, reacted };
@@ -423,10 +481,11 @@ export async function applyReactivityEvent(
   db: ReactivityAdminClient,
   clock: () => Date,
   row: EventRow,
+  opcoes: OpcoesDaReatividade = {},
 ): Promise<ReactivitySummary> {
   switch (row.event_type) {
     case "message.received":
-      return reactToInbound(db, clock, row);
+      return reactToInbound(db, clock, row, opcoes);
     case "ai.handoff_triggered":
       return reactToHandoffOpen(db, clock, row);
     case "ai.handoff_resolved":
@@ -464,6 +523,16 @@ export function createSupabaseReactivityClient(admin: SupabaseClient): Reactivit
         .maybeSingle();
       if (error) throw new Error(error.message);
       return data?.is_blocked ?? false;
+    },
+    async loadContactPersonal(orgId, contactId) {
+      const { data, error } = await admin
+        .from("contacts")
+        .select("is_personal")
+        .eq("id", contactId)
+        .eq("organization_id", orgId)
+        .maybeSingle();
+      if (error) throw new Error(error.message);
+      return (data as { is_personal?: boolean } | null)?.is_personal ?? false;
     },
     async loadLiveEnrollmentsForContact(orgId, contactId, statuses = LIVE_STATUSES) {
       const ids = await idsDoContatoEGemeos(admin, orgId, contactId);

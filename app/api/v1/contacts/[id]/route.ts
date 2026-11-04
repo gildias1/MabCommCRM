@@ -8,11 +8,12 @@ import { requireSupportWrite } from "@/lib/impersonate/support";
  */
 import { randomUUID } from "node:crypto";
 import { type NextRequest } from "next/server";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { ApiError } from "@/lib/api/types";
 import { ok, fail, noContent } from "@/lib/api/wrappers";
-import { requireRole } from "@/lib/auth/require-role";
-import { loadAuthUser, resolveActiveOrg } from "@/lib/auth/server";
+import { orgAtivaDaApi, requireRole } from "@/lib/auth/require-role";
+import { loadAuthUser } from "@/lib/auth/server";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { contactPatchSchemaDoPais, validateRequest } from "@/lib/schemas";
 import { perfilDaOrganizacao } from "@/lib/legal/perfil-do-pais";
@@ -21,6 +22,58 @@ import { createClient } from "@/lib/supabase/server";
 import { deleteContactHandler, getContactHandler, patchContactHandler } from "../_handler";
 
 export const dynamic = "force-dynamic";
+
+/**
+ * Os telefones da ficha além do principal (Spec 31, B1), e o tipo e o WhatsApp
+ * do principal, que o handler da ficha não seleciona. O filtro de organização é
+ * EXPLÍCITO nas duas leituras: o cliente de sessão tem RLS, mas a regra do
+ * repositório é não depender só dela. `wa_lid` fica de fora de propósito: é o
+ * identificador do WhatsApp daquele número, e a API não precisa dele.
+ */
+async function telefonesDaFicha(
+  supabase: SupabaseClient,
+  organizationId: string,
+  contactId: string,
+  requestId: string,
+): Promise<{
+  phone_type: string | null;
+  phone_whatsapp: string | null;
+  additional_phones: Array<{
+    phone_number: string;
+    type: string;
+    whatsapp: string;
+    label: string | null;
+    origin: string;
+    created_at: string;
+  }>;
+}> {
+  const { data: principal, error: errPrincipal } = await supabase
+    .from("contacts")
+    .select("phone_type, phone_whatsapp")
+    .eq("organization_id", organizationId)
+    .eq("id", contactId)
+    .maybeSingle();
+  const { data: extras, error: errExtras } = await supabase
+    .from("contact_phones")
+    .select("phone_number, tipo, whatsapp, rotulo, origem, created_at")
+    .eq("organization_id", organizationId)
+    .eq("contact_id", contactId)
+    .order("created_at", { ascending: true });
+  const erro = errPrincipal ?? errExtras;
+  if (erro) throw new ApiError(500, "internal_error", undefined, requestId, erro.message);
+  return {
+    phone_type: principal?.phone_type ?? null,
+    phone_whatsapp: principal?.phone_whatsapp ?? null,
+    additional_phones: (extras ?? []).map((e) => ({
+      phone_number: e.phone_number,
+      type: e.tipo,
+      whatsapp: e.whatsapp,
+      label: e.rotulo,
+      origin: e.origem,
+      created_at: e.created_at,
+    })),
+  };
+}
 
 export async function GET(
   req: NextRequest,
@@ -40,7 +93,9 @@ export async function GET(
 
   const authUser = await loadAuthUser();
   const t = (texto: string) => traduzir(texto, authUser?.idioma ?? "pt-BR");
-  const activeOrg = authUser ? await resolveActiveOrg(authUser) : null;
+  const ativa = await orgAtivaDaApi(authUser, requestId);
+  if (!ativa.ok) return ativa.response;
+  const activeOrg = ativa.org;
   if (!activeOrg) {
     return fail("no_active_org", t("No active organization."), 403, { requestId });
   }
@@ -58,7 +113,8 @@ export async function GET(
       },
       { contactId: id, decryptPurpose },
     );
-    return ok(result, { requestId });
+    const telefones = await telefonesDaFicha(supabase, activeOrg.orgId, id, requestId);
+    return ok({ ...result, ...telefones }, { requestId });
   } catch (err) {
     if (err instanceof ApiError) {
       return fail(err.code, err.message, err.status, { requestId });

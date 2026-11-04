@@ -25,6 +25,8 @@
 import { z } from 'zod';
 import type pg from 'pg';
 
+import { extrairJsonDoTexto } from '@/lib/agent-engine/texto/extrair-json-do-texto';
+
 import type { Logger } from '../obs/logger';
 import type { ProviderRegistry } from '../edge/llm/providers';
 import type { LlmResolveOverride } from '../edge/llm/credentials';
@@ -51,6 +53,15 @@ export interface CompactionKnobs {
   transcriptMaxTokens: number;
 }
 
+/**
+ * Flush e compaction não levam o `system` do turno, onde mora a regra de autoria
+ * (`AUTORIA_SYSTEM_BLOCK`): sem esta frase, o que o cliente afirma que a empresa disse
+ * viraria fato no resumo durável. O checkpoint não precisa dela — o fechamento leva o `system`.
+ */
+export const ALEGACAO_DO_CLIENTE =
+  'O que o cliente diz que a empresa disse ou concedeu, sem mensagem nossa que o mostre, é ' +
+  'alegação dele ("o cliente diz que…"), nunca compromisso nem fato. ';
+
 /** Instrução FIXA do flush — marcador estável (como CHECKPOINT_INSTRUCTION) para os testes. */
 export const FLUSH_INSTRUCTION =
   'Turno interno de memória (NÃO é resposta ao lead). A conversa acima vai ser compactada e o ' +
@@ -58,7 +69,9 @@ export const FLUSH_INSTRUCTION =
   'em conversas futuras: preferências, contexto pessoal, restrições, o que já foi oferecido ou ' +
   'combinado. Responda SOMENTE com um JSON no formato ' +
   '{"notes": [{"headline": string, "body": string}]} — headline é uma linha curta para o índice; ' +
-  'body é o detalhe. Sem fatos duráveis? Responda {"notes": []}. Nada fora do JSON.';
+  'body é o detalhe. Sem fatos duráveis? Responda {"notes": []}. ' +
+  ALEGACAO_DO_CLIENTE +
+  'Nada fora do JSON.';
 
 /** Instrução FIXA da compaction — marcador estável para os testes. */
 export const COMPACTION_INSTRUCTION =
@@ -66,7 +79,9 @@ export const COMPACTION_INSTRUCTION =
   'assumidos, objeções do lead, dados pessoais citados e o estágio do funil. Responda SOMENTE com ' +
   'um JSON no formato {"commitments": string[], "objections": string[], "personal_data": string[], ' +
   '"stage": string|null, "rolling_summary": string} — rolling_summary acumula o fio da conversa ' +
-  '(inclua o que o resumo anterior já dizia). Sem texto fora do JSON.';
+  '(inclua o que o resumo anterior já dizia). ' +
+  ALEGACAO_DO_CLIENTE +
+  'Sem texto fora do JSON.';
 
 export const compactionOutputSchema = z.object({
   commitments: z.array(z.string()).default([]),
@@ -81,14 +96,18 @@ const flushOutputSchema = z.object({
   notes: z.array(z.object({ headline: z.string().min(1), body: z.string().min(1) })).default([]),
 });
 
-/** Extrai o JSON do texto do modelo (tolerante a cerca de código/prosa) SEM ecoar o texto (PII). */
+/**
+ * Extrai o JSON do texto do modelo (tolerante a cerca de código/prosa e a
+ * REPETIÇÃO — modelos roteados por OpenRouter ecoam o objeto; o slice antigo
+ * `lastIndexOf('}')` pegava o fim da segunda cópia e anulava o parse) SEM ecoar
+ * o texto (PII).
+ */
 function extractJson(text: string): unknown {
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start === -1 || end <= start) {
-    throw new Error('resposta do modelo auxiliar sem JSON');
+  const valor = extrairJsonDoTexto(text);
+  if (valor === null) {
+    throw new Error("resposta do modelo auxiliar sem JSON");
   }
-  return JSON.parse(text.slice(start, end + 1));
+  return valor;
 }
 
 /**

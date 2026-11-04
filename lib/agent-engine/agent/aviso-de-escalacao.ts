@@ -50,7 +50,7 @@ import type {
 } from '@/lib/escalacao/passagem';
 
 import type { ChannelAdapter } from '../channel-adapter';
-import { runBeforeSend } from '../guardrails/before-send';
+import { runBeforeSend, type TipoDeEnvio } from '../guardrails/before-send';
 import type { LgpdInput } from '../guardrails/lgpd/legal-basis';
 import type { Logger } from '../obs/logger';
 
@@ -105,6 +105,20 @@ export interface AvisoDeEscalacaoOpts {
   agentId?: string | null;
   disclosureMode?: 'inject' | 'veto';
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * O TIPO do envio que este aviso É (#2112, coluna `before_send_traces.tipo_envio`).
+   *
+   * `resposta` (DEFAULT) = o aviso responde a quem escreveu e pediu pessoa, que é
+   * o caso do turno de inbound/case — a janela que vale é a de `resposta_*` (0495).
+   * `disparo` = a escalação nasceu DENTRO de um follow-up: ali ninguém escreveu
+   * nada agora, é retomada, e a janela que vale é a de `window_*`. Com a janela de
+   * resposta mais estreita que a de disparo, o `resposta: true` fixo vetava pelo
+   * lado errado e o trace registrava um veto que a janela de disparo não daria.
+   *
+   * Default `resposta` de propósito: todo chamador que hoje não declara origem é o
+   * caminho de resposta (#1984), e omitir o campo não pode abrir o disparo.
+   */
+  origem?: TipoDeEnvio;
 }
 
 /**
@@ -152,10 +166,22 @@ export async function avisarLeadDaEscalacao(
       channelSessionId: ids.channelSessionId,
       body,
       optedOutThisTurn: opts.optedOutThisTurn,
+      // O TIPO do envio decide qual janela o gate avalia (#2112): `resposta_*`
+      // (0495) quando o aviso responde a quem escreveu e pediu pessoa, e
+      // `window_*` quando ele nasce dentro de um follow-up (`origem: 'disparo'`)
+      // — retomada, não resposta. O `true` fixo de #1984 estava certo para o
+      // turno de inbound e ERRADO para o follow-up: com a janela de resposta mais
+      // estreita que a de disparo, o aviso de quem pediu pessoa dentro de um
+      // disparo era vetado pela janela de quem não escreveu nada.
+      resposta: opts.origem !== 'disparo',
       // Ver `GateContext.spinningEnforced`: com o gate armado, a terceira pessoa
       // a ser escalada na mesma janela do número receberia silêncio — pelo
       // guardrail. Este é o ÚNICO chamador que o desarma.
       enforceSpinning: false,
+      // Texto fixo deste arquivo, não da IA: a restrição comercial (#2877) não o
+      // julga. Sem o `false`, a cadeia leria a escolha da organização — e o aviso
+      // que a própria passagem comercial manda poderia ser barrado por ela.
+      enforceCommercialRestriction: false,
       // Mesmo débito declarado no caminho do agente e no da re-entrada: o
       // daily_message_limit do CRM ainda não é lido no runtime.
       crmDailyLimit: null,
@@ -183,6 +209,10 @@ export async function avisarLeadDaEscalacao(
       const codigo = CODIGO_DO_VETO[chain.code];
       return {
         avisado: false,
+        // O código REAL do gate: `contato_bloqueado` (opt-out) e
+        // `atendimento_com_humano` (a conversa foi passada para a equipe) são
+        // desfechos diferentes, e este campo é lido por quem diagnostica o
+        // aviso que não saiu (#3310).
         porque: chain.code,
         ...(codigo !== undefined ? { motivoCodigo: codigo } : {}),
       };

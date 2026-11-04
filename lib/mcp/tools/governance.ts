@@ -12,7 +12,9 @@
  */
 import { z } from "zod";
 
+import { observeServiceOrigin } from "@/lib/atendimento/origem";
 import { audit } from "@/lib/audit";
+import { logger } from "@/lib/logger";
 import { normalizarTags } from "@/lib/contacts/tag-normalizada";
 import { conversationTagSchema, conversationTagsSchema } from "@/lib/schemas/messaging";
 import { getQueueStatus } from "@/lib/routing/queue";
@@ -58,7 +60,8 @@ export const crmAssignConversation: McpToolDefinition<typeof assignInputShape> =
     "Atribui/transfere uma conversa a um atendente (reason='transfer', to_user_id preenchido) " +
     "ou libera de volta à fila (reason='release', to_user_id null). Grava assignment event " +
     "auditado. Recusa destino de outra org (guard de membership). Idempotente: se a conversa " +
-    "já está no estado alvo, retorna sucesso sem duplicar evento.",
+    "já está no estado alvo, retorna sucesso sem duplicar evento. Atribuir não interrompe o seu " +
+    "próprio turno: pode ser chamada junto com a passagem para uma pessoa, em qualquer ordem.",
   inputSchema: assignInputShape,
   category: "write",
   requiresRole: "agent",
@@ -96,6 +99,14 @@ export const crmAssignConversation: McpToolDefinition<typeof assignInputShape> =
     // true com o dono que ACABAMOS de ler ⇒ optimistic lock: sob CORRIDA (dois
     // assigns idênticos leem o mesmo dono antigo), o 1º vence (1 evento) e o 2º
     // vê o dono já mudado (v_from ≠ expected) ⇒ 0 rows, SEM evento duplicado.
+    //
+    // `p_source_job_id` (#3926): o turno DIZ que foi ele quem atribuiu, e o
+    // gatilho de assumir poupa esse job em vez de revogá-lo. Vem de
+    // `ctx.sourceJobId` — campo que o runtime injeta e o modelo NÃO escreve —,
+    // então é nulo em toda chamada de fora do turno (rota MCP, Inbox, automação)
+    // e o comportamento delas não muda. Sem isso, o próprio turno era marcado
+    // `failed`/`conversation_command_taken` e a passagem e a mudança de etapa
+    // que vinham depois morriam na guarda de fronteira.
     const { data: rows, error: assignErr } = await ctx.supabase.rpc("fn_conversation_assign", {
       p_organization_id: ctx.organizationId,
       p_conversation_id: parsed.conversation_id,
@@ -103,6 +114,7 @@ export const crmAssignConversation: McpToolDefinition<typeof assignInputShape> =
       p_reason: parsed.reason,
       p_expected_assignee: currentOwner,
       p_enforce_expected: true,
+      p_source_job_id: ctx.sourceJobId ?? null,
     });
     if (assignErr) throw new Error(assignErr.message);
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -165,6 +177,19 @@ const TAG_AUDIT_ACTION = {
   lead: "lead.tags_changed",
 } as const;
 
+/**
+ * O evento "ganhou tag" de cada alvo — o MESMO que a tela emite (PATCH de
+ * contato em `app/api/v1/contacts/_handler.ts`, PATCH de negócio em
+ * `app/api/v1/leads/_handler.ts`). Sem ele, a regra "Quando um contato ganhar
+ * uma tag" disparava quando a pessoa punha a tag na tela e ficava muda quando
+ * um sistema de fora (n8n) punha a mesma tag pela MCP — a mesma ação, dois
+ * desfechos. Conversa não tem esse gatilho: fica de fora.
+ */
+const TAG_ADDED_EVENT = {
+  contact: { eventType: "contact.tag_added", entityKind: "contact" },
+  lead: { eventType: "lead.tag_added", entityKind: "crm_lead" },
+} as const;
+
 const tagsInputShape = {
   target_kind: z.enum(["conversation", "contact", "lead"]),
   target_id: z.string().uuid(),
@@ -191,22 +216,38 @@ export const crmManageTags: McpToolDefinition<typeof tagsInputShape> = {
 
     const table = TAG_TARGET_TABLE[input.target_kind];
 
-    const { data: row, error: fetchErr } = await ctx.supabase
+    // O contato do negócio entra na origem do atendimento do evento "ganhou tag".
+    const colunas: string = input.target_kind === "lead" ? "id, tags, contact_id" : "id, tags";
+    const { data, error: fetchErr } = await ctx.supabase
       .from(table)
-      .select("id, tags")
+      .select(colunas)
       .eq("id", input.target_id)
       .eq("organization_id", ctx.organizationId)
       .maybeSingle();
     if (fetchErr) throw new Error(fetchErr.message);
-    if (!row) throw new Error("target_not_found");
+    if (!data) throw new Error("target_not_found");
+    const row = data as unknown as { tags: string[] | null; contact_id?: string | null };
 
     // O que já está gravado pode vir em caixa mista (dado anterior à #1224):
     // sem normalizar aqui, `remove: ["vip"]` não alcançaria o "VIP" do banco e
     // o marcador ficaria impossível de tirar pela MCP.
-    const current = normalizarTags((row as { tags: string[] | null }).tags ?? []);
+    const current = normalizarTags(row.tags ?? []);
     const merged = [...current, ...addTags].filter((t) => !removeTags.has(t));
     // Dedup + teto de 20 (rejeita se estourar) — mesma validação da G3-05.
     const nextTags = conversationTagsSchema.parse(merged);
+
+    // Só as tags que o alvo NÃO tinha: pôr de novo a que já estava não é "ganhar".
+    const addedTags = nextTags.filter((t) => !current.includes(t));
+    const eventoDeTag = input.target_kind === "conversation" ? null : TAG_ADDED_EVENT[input.target_kind];
+    const contatoDoAlvo =
+      input.target_kind === "contact"
+        ? input.target_id
+        : (row.contact_id ?? null);
+    // Observada ANTES da escrita, como a tela faz: é o atendimento em que a tag entrou.
+    const tagServiceOrigin =
+      eventoDeTag && addedTags.length > 0
+        ? await observeServiceOrigin(ctx.supabase, ctx.organizationId, contatoDoAlvo)
+        : null;
 
     const { error: updateErr } = await ctx.supabase
       .from(table)
@@ -226,6 +267,26 @@ export const crmManageTags: McpToolDefinition<typeof tagsInputShape> = {
       requestId: ctx.requestId,
       metadata: { ...a.metadataActor, tags: nextTags, via: "mcp" },
     });
+
+    if (eventoDeTag && addedTags.length > 0) {
+      // Mesmo envelope da tela. A tag já está gravada: falha ao emitir vira log,
+      // nunca desfaz a escrita nem derruba a ferramenta.
+      const { error: emitErr } = await ctx.supabase.rpc("emit_event", {
+        p_event_type: eventoDeTag.eventType,
+        p_entity_kind: eventoDeTag.entityKind,
+        p_entity_id: input.target_id,
+        p_payload: { added_tags: addedTags, tags: nextTags, service_origin: tagServiceOrigin },
+        p_metadata: { request_id: ctx.requestId, ...a.metadataActor, via: "mcp" },
+        p_organization_id: ctx.organizationId,
+      });
+      if (emitErr) {
+        logger.error("[crm_manage_tags] emit_event falhou", {
+          organization_id: ctx.organizationId,
+          event_type: eventoDeTag.eventType,
+          error: emitErr.message,
+        });
+      }
+    }
 
     return { target_kind: input.target_kind, target_id: input.target_id, tags: nextTags };
   },

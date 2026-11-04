@@ -58,28 +58,29 @@
  */
 import type pg from 'pg';
 
+import { CLASSIFIER_CONTEXT_MESSAGES, MAX_CLASSIFIER_CONTEXT_MESSAGES, contextoDoClassificador } from '@/lib/ai/classifier-context';
+
 import { consultarJevNoRoteador } from '@/lib/ai/decisao/roteador';
 import type { DependenciasDoPonto } from '@/lib/ai/decisao/ponto';
 
 import type { Logger } from '../obs/logger';
 import type { LlmEdgeConfig } from '../edge/llm/run-model-call';
+import { temIaDeSempre } from '../edge/llm/credentials';
 import { agenteDaCampanhaDaConversa } from './agente-da-campanha';
+import { agentePorRemetente } from './sender-routing';
+import { registrarDecisaoDoRoteador } from './router-decision-log';
 import { loadActiveRouter, type LoadedRouter, type RouterMember } from './router-config';
 import {
+  escolherAgenteDoNumero,
   loadPublishedAgentConfig,
   loadPublishedAgentConfigById,
+  type EscolhaDoNumero,
   type PublishedAgentConfig,
+  type RastroDoPublico,
 } from './agent-config';
 import { classifyIntent, type ClassifierContextMessage, type IntentVerdict } from './intent-classifier';
+import { corpoDaMensagem, type CorpoDaMensagemRow } from '../edge/crm/get-lead-context';
 
-/**
- * Janela de contexto passada ao CLASSIFICADOR, não confundir com
- * `context_message_window` do agente (esse alimenta o modelo que conversa
- * com o lead). Curta de propósito: o classificador roda em todo turno,
- * inclusive sticky (regra 2 abaixo) — histórico completo pagaria caro por
- * turno pra resolver só ambiguidade de resposta curta.
- */
-const CLASSIFIER_CONTEXT_MESSAGES = 4;
 
 export interface TurnAgentResolution {
   config: PublishedAgentConfig | null; // null ⇒ turno segue no genérico (comportamento atual)
@@ -102,6 +103,30 @@ export interface TurnAgentResolution {
    * — fallback/sem-router NÃO começam fluxo.
    */
   flowPointerId?: string | null;
+  /**
+   * Funil/etapa de DESTINO da intenção casada (#2155). Valem também em sticky:
+   * o card é levado ao funil do produto na PRIMEIRA mensagem e fica lá — a
+   * transferência idempotente (`ja_no_destino`) não reprocessa os seguintes.
+   * `null`/ausente = sem destino configurado, nada muda.
+   */
+  destinationPipelineId?: string | null;
+  destinationStageId?: string | null;
+  /**
+   * O PÚBLICO do agente barrou este contato (#3722) e nenhum outro agente do
+   * número o aceita. `config` vem `null` e o turno NÃO pode cair no agente
+   * genérico: ele termina sem modelo, sem caso e sem aviso, com o motivo no
+   * log. A mensagem continua na caixa de entrada — a mesma defesa do filtro de
+   * palavra-chave (`palavra-chave-do-gatilho.ts`), e o oposto do defeito da
+   * issue, em que o genérico assumia calado.
+   */
+  silencioPeloPublico?: boolean;
+  /**
+   * O RASTRO da decisão do público neste turno (#3722): a fila de candidatos do
+   * número, a posição de cada um e a regra que o liberou ou barrou. Só existe
+   * quando alguém declarou público — é o que permite responder "por que o
+   * agente de vendas não respondeu este cliente?" sem abrir o banco.
+   */
+  rastroDoPublico?: RastroDoPublico;
 }
 
 export interface ResolveTurnAgentDeps {
@@ -111,11 +136,20 @@ export interface ResolveTurnAgentDeps {
   loadActiveRouter?: typeof loadActiveRouter;
   loadPublishedAgentConfigById?: typeof loadPublishedAgentConfigById;
   loadPublishedAgentConfig?: typeof loadPublishedAgentConfig;
+  /**
+   * A escolha do agente do número (#3722). Default: a régua real, com público.
+   * Os testes que injetam só `loadPublishedAgentConfig` continuam valendo — a
+   * escolha é derivada dele, sem caminho paralelo.
+   */
+  escolherAgenteDoNumero?: typeof escolherAgenteDoNumero;
   classifyIntent?: typeof classifyIntent;
   /** O Jev ao lado do classificador (`lib/ai/decisao/roteador.ts`). */
   consultarJev?: typeof consultarJevNoRoteador;
   /** Chave e `fetch` do Jev — dublês só no teste. Default: a chave da organização e o egress com allowlist. */
   jev?: DependenciasDoPonto;
+  registrarDecisao?: typeof registrarDecisaoDoRoteador;
+  /** Default: a mesma resolução de chave que a IA de sempre faz antes de sair. */
+  temIaDeSempre?: typeof temIaDeSempre;
 }
 
 /**
@@ -136,6 +170,13 @@ export type DestinoDoVeredito =
       confidence: number | null;
     }
   | { membro: null; outcome: 'no_match' | 'classifier_failed'; confidence: number | null };
+
+/** Mesma condição para dispensar a reserva no turno e na prévia do painel. */
+export function vereditoConfiavelDoRoteador(router: LoadedRouter, verdict: IntentVerdict | null): boolean {
+  return verdict !== null && verdict.falhou !== true && verdict.intentName !== null &&
+    verdict.confidence >= router.minConfidence &&
+    router.members.some((m) => m.intentName === verdict.intentName);
+}
 
 export function destinoDoVeredito(
   router: LoadedRouter,
@@ -195,6 +236,8 @@ export async function resolveTurnAgent(
     channelSessionId: string;
     conversationId: string;
     signal: string | null;
+    /** Texto que o cliente digitou na última inbound ('' para mídia) — o Jev, R4. */
+    signalBody?: string | null;
     /** A mensagem de onde o `signal` saiu — amarra a observação do Jev a ela. */
     signalMessageId?: string | null;
     stickyAgentId: string | null;
@@ -204,13 +247,80 @@ export async function resolveTurnAgent(
   },
   deps: ResolveTurnAgentDeps,
 ): Promise<TurnAgentResolution> {
+  const inicioDoRoteamento = Date.now();
   const _loadActiveRouter = deps.loadActiveRouter ?? loadActiveRouter;
   const _loadAgentById = deps.loadPublishedAgentConfigById ?? loadPublishedAgentConfigById;
-  const _loadAgentBySession = deps.loadPublishedAgentConfig ?? loadPublishedAgentConfig;
+  // A ESCOLHA do agente do número, com o público (#3722). Quando o teste injeta
+  // só `loadPublishedAgentConfig`, ela é derivada dele — a régua do público não
+  // fica de fora da injeção, e não há segunda escolha.
+  const _escolherDoNumero: typeof escolherAgenteDoNumero =
+    deps.escolherAgenteDoNumero ??
+    (deps.loadPublishedAgentConfig !== undefined
+      ? async (db, org, sessao, contato) => ({
+          config: await deps.loadPublishedAgentConfig!(db, org, sessao, contato),
+          motivo: 'primeiro_da_fila' as const,
+        })
+      : escolherAgenteDoNumero);
+  /** O agente do número para ESTE contato, com o motivo (público incluído). */
+  const agenteDoNumero = (): Promise<EscolhaDoNumero> =>
+    _escolherDoNumero(db, input.tenantId, input.channelSessionId, input.leadId);
+  /**
+   * O rastro do público (#3722), registrado UMA vez por turno e devolvido na
+   * resolução.
+   *
+   * O log leva a FILA com a decisão de cada candidato — não uma frase solta:
+   * "o vendedor barrou por `exclude_tags: cliente ativo`, o suporte liberou".
+   * Leva só o item DECLARADO na config (nunca a lista de etiquetas do contato:
+   * `fields` do logger não carrega dado do lead) e nada quando nenhum agente do
+   * número declarou público — quem não usa o recurso não paga uma linha por
+   * turno.
+   */
+  const rastroDoPublico = (escolha: EscolhaDoNumero): Pick<TurnAgentResolution, 'rastroDoPublico'> => {
+    const rastro = escolha.rastro;
+    if (rastro === undefined) return {};
+    deps.log.info('público do agente: quem foi considerado no número (#3722)', {
+      tenantId: input.tenantId,
+      conversationId: input.conversationId,
+      contactId: input.leadId,
+      escolhido: rastro.escolhidoAgentId,
+      contatoAvaliado: rastro.contatoAvaliado,
+      candidatos: rastro.candidatos.map((c) => ({
+        agente: c.agentName,
+        posicao: c.posicao,
+        pausado: c.pausado,
+        sem_publico: c.semPublico,
+        regra: c.decisao?.regra ?? 'nao_avaliado',
+        valor: c.decisao?.valor ?? null,
+      })),
+    });
+    return { rastroDoPublico: rastro };
+  };
   const _classifyIntent = deps.classifyIntent ?? classifyIntent;
   const _consultarJev = deps.consultarJev ?? consultarJevNoRoteador;
 
+  // As duas marcas decidem o `catch`: sem o roteador carregado não se sabe se
+  // há regra por remetente, e cair no agente da sessão aí seria atender pelo
+  // agente errado justamente quando a regra existe.
+  let roteadorCarregado = false;
+  let temRegrasDeRemetente = false;
   try {
+    const router = await _loadActiveRouter(db, input.tenantId, input.channelSessionId);
+    roteadorCarregado = true;
+    temRegrasDeRemetente = router?.senderRoutes !== undefined &&
+      (!Array.isArray(router.senderRoutes) || router.senderRoutes.length > 0);
+    if (router && temRegrasDeRemetente) {
+      const { agentId, reserved } = await agentePorRemetente(db, input, router);
+      // O canal opera em modo de identidade: agentes internos nunca entram por
+      // classificação, campanha, sticky antigo ou fallback genérico.
+      const destino = agentId ?? router.fallbackAgentId;
+      const config = destino ? await _loadAgentById(db, input.tenantId, destino) : null;
+      if (!config) throw new Error('sender_route_agent_unpublished');
+      if (!agentId && reserved.has(config.agentId)) throw new Error('sender_route_reserved_fallback');
+      return {
+        config, routerId: router.id, intentName: agentId ? 'remetente_autorizado' : null,
+        confidence: null, outcome: agentId ? 'classified' : 'fallback',
+      };
+    }
     // ─── Degrau 0: a campanha que criou esta conversa ───
     //
     // ACIMA do roteador de propósito. O roteador é do NÚMERO e classifica
@@ -233,14 +343,22 @@ export async function resolveTurnAgent(
       });
     }
 
-    const router = await _loadActiveRouter(db, input.tenantId, input.channelSessionId);
     if (router === null) {
+      const escolha = await agenteDoNumero();
+      if (escolha.motivo === 'publico_barrou') {
+        deps.log.info(
+          'turno sem agente — nenhum agente publicado no número aceita o público deste contato (#3722)',
+          { tenantId: input.tenantId, conversationId: input.conversationId, contactId: input.leadId },
+        );
+      }
       return {
-        config: await _loadAgentBySession(db, input.tenantId, input.channelSessionId),
+        config: escolha.config,
         routerId: null,
         intentName: null,
         confidence: null,
         outcome: 'no_router',
+        ...(escolha.motivo === 'publico_barrou' ? { silencioPeloPublico: true } : {}),
+        ...rastroDoPublico(escolha),
       };
     }
 
@@ -253,14 +371,39 @@ export async function resolveTurnAgent(
         // Regra 5: sem fallback declarado, quem atende é o agente publicado da
         // SESSÃO — o comportamento de antes do router existir. `null` aqui
         // (nenhum publicado) segue caindo no genérico, como sempre.
-        const daSessao = await _loadAgentBySession(db, input.tenantId, input.channelSessionId);
-        if (daSessao === null) {
+        const escolha = await agenteDoNumero();
+        if (escolha.motivo === 'publico_barrou') {
+          // #3722: o agente do número existe, mas o público dele barra este
+          // contato. O genérico NÃO assume — silêncio, como na regra do número.
+          deps.log.info('resolve-turn-agent: público do agente do número barrou o contato — turno silenciado', {
+            routerId: router.id,
+            outcome,
+            contactId: input.leadId,
+          });
+          return {
+            config: null,
+            routerId: router.id,
+            intentName: null,
+            confidence,
+            outcome,
+            silencioPeloPublico: true,
+            ...rastroDoPublico(escolha),
+          };
+        }
+        if (escolha.config === null) {
           deps.log.warn('resolve-turn-agent: router sem fallback e sessão sem agente publicado — turno cai no genérico', {
             routerId: router.id,
             outcome,
           });
         }
-        return { config: daSessao, routerId: router.id, intentName: null, confidence, outcome };
+        return {
+          config: escolha.config,
+          routerId: router.id,
+          intentName: null,
+          confidence,
+          outcome,
+          ...rastroDoPublico(escolha),
+        };
       }
       const config = await _loadAgentById(db, input.tenantId, router.fallbackAgentId);
       if (config === null) {
@@ -312,6 +455,8 @@ export async function resolveTurnAgent(
         // conversa em curso: devolvê-lo recomeçaria o roteiro a cada turno — e,
         // depois de concluído, de novo, para sempre.
         flowPointerId: outcome === 'sticky' ? null : (member.flowPointerId ?? null),
+        destinationPipelineId: member.destinationPipelineId ?? null,
+        destinationStageId: member.destinationStageId ?? null,
       };
     };
 
@@ -330,13 +475,18 @@ export async function resolveTurnAgent(
       return resolveFallback('no_match', null);
     }
 
-    // O Jev pergunta o mesmo, AO MESMO TEMPO (onda 2 do Jev, bloco 2.2): só a
-    // mensagem, sem o contexto (R4). Observando, o turno não espera por ele.
+    // O Jev pergunta o mesmo (onda 2 do Jev, bloco 2.2): só a mensagem, sem o
+    // contexto (R4) — o histórico do Jev espera a TypeSafe (DEC-012, escolha 2).
+    // A janela do roteador vale só para a IA de sempre. Observando, o turno não
+    // espera por ele.
+    // A mensagem é apenas o que o cliente digitou (`signalBody`), '' para mídia:
+    // a transcrição estaria no `signal` composto e não vai ao Jev (R4).
+    const recentMessages = contextoDoClassificador(input.recentMessages ?? [], router.contextMessageCount ?? CLASSIFIER_CONTEXT_MESSAGES);
     const jev = _consultarJev(
       db,
       {
         organizationId: input.tenantId,
-        mensagem: input.signal,
+        mensagem: input.signalBody === undefined ? input.signal : (input.signalBody ?? ''),
         membros: router.members,
         contactId: input.leadId,
         jobId: input.jobId,
@@ -344,20 +494,26 @@ export async function resolveTurnAgent(
       deps.jev,
     );
 
-    // classifica — inclusive com sticky ativo, pra detectar troca de assunto (regra 2).
-    const verdict = await _classifyIntent(
-      db,
-      llmCfg,
-      {
-        tenantId: input.tenantId,
-        leadId: input.leadId,
-        jobId: input.jobId,
-        router,
-        signal: input.signal,
-        recentMessages: input.recentMessages ?? [],
-      },
+    // Em comparação, a classificação da IA de sempre começa em paralelo com o Jev.
+    // Sob demanda, só há esta chamada se o Jev não trouxer intenção confiável.
+    const modo = await (jev.modo ?? Promise.resolve('comparacao'));
+    const estadoLido = await jev.estado;
+    const classificar = () => _classifyIntent(
+      db, llmCfg,
+      { tenantId: input.tenantId, leadId: input.leadId, jobId: input.jobId, router, signal: input.signal!, recentMessages },
       { log: deps.log },
     );
+    // Decisão B (doc 89): o Jev só roteia sozinho onde a empresa tem a IA de
+    // sempre, a reserva dele. Sem ela, vale a regra de hoje (R2): comparação,
+    // e a escolha do Jev só vale com a IA de sempre tendo respondido. A pergunta
+    // é feita aqui, por roteador e com o provedor dele, porque a chave pode sumir
+    // depois de o modo ser escolhido na tela.
+    const independente = modo === 'sob_demanda' && estadoLido === 'decidindo' &&
+      await (deps.temIaDeSempre ?? temIaDeSempre)(db, llmCfg, input.tenantId, router.classifierProvider);
+    const comparacao = independente ? null : classificar();
+    const escolhaIndependente = independente ? await jev.escolha : null;
+    const jevConfiavel = vereditoConfiavelDoRoteador(router, escolhaIndependente?.veredito ?? null);
+    const verdict = comparacao !== null ? await comparacao : jevConfiavel ? null : await classificar();
 
     // Decidindo, vale a escolha do Jev, e a IA de sempre é a reserva. Sem a IA
     // de sempre (a chamada falhou, a saída não era resposta, ou a empresa não
@@ -366,8 +522,10 @@ export async function resolveTurnAgent(
     // (sticky ou `no_match`); só não conta como a IA ter respondido: um modelo
     // que nunca devolve JSON deixaria o Jev rotear sozinho, sem alarme.
     const iaRespondeu = verdict !== null && verdict.falhou !== true;
-    const estadoDoJev = iaRespondeu ? await jev.estado : null;
-    const doJev = estadoDoJev === 'decidindo' ? await jev.escolha : null;
+    const estadoDoJev = independente ? 'decidindo' : iaRespondeu ? await jev.estado : null;
+    const doJev = independente
+      ? jevConfiavel ? escolhaIndependente : null
+      : estadoDoJev === 'decidindo' ? await jev.escolha : null;
     const destino = destinoDoVeredito(router, stickyMember, input.stickyIntent, doJev?.veredito ?? verdict);
 
     jev.observar({
@@ -375,25 +533,53 @@ export async function resolveTurnAgent(
       messageId: input.signalMessageId ?? null,
       rotuloDe: (v) => agenteDoDestino(router, destinoDoVeredito(router, stickyMember, input.stickyIntent, v)),
       // Sem resposta da IA não há par: a linha fica sem o lado dela, fora da concordância.
-      vereditoDaIa: iaRespondeu ? verdict : null,
+      // Reservas são uma amostra selecionada por falha/baixa confiança, não
+      // um par comparativo. Também ficam fora do indicador antigo do cartão.
+      vereditoDaIa: !independente && iaRespondeu ? verdict : null,
       decidiu: doJev !== null,
       // Decidindo, sem a escolha dele, valeu a da IA de sempre: é cobertura, e ela deixa rastro.
-      aIaCobriu: estadoDoJev === 'decidindo' && doJev === null,
+      aIaCobriu: estadoDoJev === 'decidindo' && doJev === null && iaRespondeu,
     });
 
-    return destino.membro !== null
+    const resultado = await (destino.membro !== null
       ? loadMatchedOrFallback(destino.outcome, destino.membro, destino.intentName, destino.confidence)
-      : resolveFallback(destino.outcome, destino.confidence);
+      : resolveFallback(destino.outcome, destino.confidence));
+    const motivoReserva = !independente || jevConfiavel ? null
+      : escolhaIndependente === null ? 'falha_jev'
+      : escolhaIndependente.veredito.intentName === null ? 'sem_intencao'
+      : escolhaIndependente.veredito.confidence < router.minConfidence ? 'baixa_confianca'
+      : 'intencao_invalida';
+    await (deps.registrarDecisao ?? registrarDecisaoDoRoteador)(db, {
+      organizationId: input.tenantId, routerId: router.id, conversationId: input.conversationId,
+      messageId: input.signalMessageId ?? null, jobId: input.jobId,
+      modo: independente ? 'jev_sob_demanda' : estadoLido === 'decidindo' ? 'jev_comparacao' : 'tradicional_comparacao',
+      contextMessageCount: recentMessages.length,
+      origem: independente ? doJev ? 'jev' : 'reserva' : doJev ? 'jev' : 'tradicional',
+      motivoReserva,
+      intentJev: escolhaIndependente?.veredito.intentName ?? doJev?.veredito.intentName ?? null,
+      intentTradicional: verdict?.intentName ?? null,
+      jev: escolhaIndependente ?? doJev,
+      jevSolicitado: estadoLido !== 'desligada',
+      chamouTradicional: comparacao !== null || !jevConfiavel,
+      resultado,
+      tempoTotalMs: Date.now() - inicioDoRoteamento,
+    });
+    return resultado;
   } catch (err) {
     deps.log.warn('resolve-turn-agent: erro inesperado no router — turno cai no fluxo sem router', {
       error: err instanceof Error ? err.message : String(err),
     });
+    // Erro de identidade não pode abrir o atendimento genérico com ferramentas.
+    if (!roteadorCarregado || temRegrasDeRemetente) throw err;
+    // #3722: a escolha do número (com público) erra para FORA, como a leitura
+    // de antes: engolir o erro aqui devolveria `config: null`, e o turno cairia
+    // no agente genérico — que responde exatamente o contato que o público
+    // barra. Sem agente decidido, a fila re-tenta o job.
+    const escolha = await agenteDoNumero();
     return {
-      config: await _loadAgentBySession(db, input.tenantId, input.channelSessionId),
-      routerId: null,
-      intentName: null,
-      confidence: null,
-      outcome: 'classifier_failed',
+      config: escolha.config,
+      routerId: null, intentName: null, confidence: null, outcome: 'classifier_failed',
+      ...(escolha.motivo === 'publico_barrou' ? { silencioPeloPublico: true } : {}),
     };
   }
 }
@@ -420,30 +606,43 @@ export async function resolveConversationTurn(
     [input.tenantId, input.conversationId],
   );
   const signalRow = input.inbound
-    ? (await db.query<{ id: string; body: string | null }>(
-        "select id,body from messages where organization_id=$1 and conversation_id=$2 and direction='inbound' order by sent_at desc,created_at desc,id desc limit 1",
+    ? (await db.query<{ id: string } & CorpoDaMensagemRow>(
+        "select id,body,type,media_url,media_storage_path,media_derived_text from messages where organization_id=$1 and conversation_id=$2 and direction='inbound' order by sent_at desc,created_at desc,id desc limit 1",
         [input.tenantId, input.conversationId],
       )).rows[0] ?? null
     : null;
-  const signal = signalRow?.body ?? null;
+  // signal = o texto EFETIVO do turno, composto pelo mesmo caminho do agente
+  // (#617): o que o cliente digitou OU a transcrição do áudio já pronta
+  // (media_derived_status = ready ⇒ media_derived_text preenchido). Áudio SEM
+  // transcrição (sem texto digitado nem derivado) segue como `null` → regra 6.
+  const signal =
+    signalRow !== null && (signalRow.body !== null || (signalRow.media_derived_text ?? '').trim() !== '')
+      ? corpoDaMensagem(signalRow)
+      : null;
+  // O que o cliente DIGITOU, cru — o Jev recebe só isso (R4), nunca a transcrição.
+  const signalBody = signalRow?.body ?? null;
 
   // Contexto curto pro CLASSIFICADOR (regra 2 abaixo desambigua resposta
   // curta em meio a fluxo) — nunca o histórico completo. Só busca quando há
-  // signal: sem inbound (regra 6) o classificador nem roda.
+  // signal: sem inbound (regra 6) o classificador nem roda. Inclui mídia
+  // transcrita: a linha entra composta pelo corpo canônico (corpoDaMensagem).
   let recentMessages: ClassifierContextMessage[] = [];
   if (signalRow !== null && signal !== null) {
-    const { rows: contextRows } = await db.query<ClassifierContextMessage>(
-      `select direction,body from messages
-       where organization_id=$1 and conversation_id=$2 and body is not null and id<>$3
+    const { rows: contextRows } = await db.query<{ direction: 'inbound' | 'outbound' } & CorpoDaMensagemRow>(
+      `select direction,body,type,media_url,media_storage_path,media_derived_text from messages
+       where organization_id=$1 and conversation_id=$2 and (body is not null or media_derived_text is not null) and id<>$3
        order by sent_at desc,created_at desc,id desc limit $4`,
-      [input.tenantId, input.conversationId, signalRow.id, CLASSIFIER_CONTEXT_MESSAGES],
+      [input.tenantId, input.conversationId, signalRow.id, MAX_CLASSIFIER_CONTEXT_MESSAGES],
     );
-    recentMessages = contextRows.reverse();
+    recentMessages = contextRows
+      .map((r) => ({ direction: r.direction, body: corpoDaMensagem(r) }))
+      .reverse();
   }
 
   return resolveTurnAgent(db, llmCfg, {
     ...input,
     signal,
+    signalBody,
     signalMessageId: signalRow?.id ?? null,
     recentMessages,
     stickyAgentId: rows[0]?.active_ai_agent_id ?? null,

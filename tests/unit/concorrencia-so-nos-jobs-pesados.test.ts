@@ -35,13 +35,33 @@ const SEM_GRUPO: Record<string, string[]> = {
   "publish-image.yml": ["imagens-ok", "promover-stable", "a-tag-veio-da-main"],
 };
 
+// Todos os jobs declarados de um workflow — o bloco `jobs:`, recortado pela
+// mesma indentação de dois espaços do `blocoDoJob` (nenhum parser YAML aqui).
+// Serve para a conta dos dois mapas fechar: hoje os 16 jobs dos quatro
+// workflows da #1159 estão nos dois lados, mas nada impedia um job NOVO de
+// nascer fora dos dois.
+function jobsDoWorkflow(texto: string): string[] {
+  const marca = /^jobs:$/m.exec(texto);
+  if (!marca) throw new Error("bloco jobs: não encontrado");
+  const nomes: string[] = [];
+  for (const linha of texto.slice(marca.index + "jobs:".length).split("\n")) {
+    // O bloco `jobs:` vai até a primeira linha de coluna 0 que não seja
+    // comentário nem vazia — `on:`, `permissions:` etc. já passaram.
+    if (linha && !linha.startsWith(" ") && !linha.startsWith("#")) break;
+    const job = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(linha);
+    const nome = job?.[1];
+    if (nome) nomes.push(nome);
+  }
+  return nomes;
+}
+
 describe("concurrency: só nos jobs pesados", () => {
   it.each(Object.keys(PESADOS))("%s não declara concurrency no nível do workflow", (arq) => {
     expect(ler(arq)).not.toMatch(/^concurrency:/m);
   });
 
   it.each(Object.entries(PESADOS).flatMap(([a, js]) => js.map((j) => [a, j])))(
-    "%s::%s tem grupo por PR e só cancela em pull_request (publish-image: também na main)",
+    "%s::%s isola PR/ref e cancela revisões substituídas de PR/main",
     (arq, job) => {
       const bloco = blocoDoJob(ler(arq), job);
       expect(bloco).toMatch(/^ {4}concurrency:\n {6}group: .*github\.event\.pull_request\.number \|\| github\.ref/m);
@@ -51,11 +71,16 @@ describe("concurrency: só nos jobs pesados", () => {
       expect(bloco).toContain(
         "${{ github.event_name == 'pull_request' && github.run_attempt != '1' && format('-reentrada-{0}', github.event.pull_request.head.sha) || '' }}",
       );
+      // Só os testes ganham a proteção adicional de rerun da main. A política
+      // de publicação permanece com seu contrato e controle próprios.
+      if (arq !== "publish-image.yml") {
+        expect(bloco).toContain(
+          "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt != '1' && format('-reentrada-{0}', github.sha) || '' }}",
+        );
+      }
       const cancela = bloco.match(/^ {6}cancel-in-progress: (.*)$/m)?.[1];
       expect(cancela).toBe(
-        arq === "publish-image.yml"
-          ? "${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}"
-          : "${{ github.event_name == 'pull_request' }}",
+        "${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
       );
     },
   );
@@ -68,4 +93,22 @@ describe("concurrency: só nos jobs pesados", () => {
       expect(blocoDoJob(ler(arq), job)).not.toMatch(/^ {4}concurrency:/m);
     },
   );
+
+  // A conta fecha, e ela é o que faltava para a guarda valer amanhã: PESADOS e
+  // SEM_GRUPO cobrem os 16 jobs de hoje, mas nada aqui impedia um job NOVO de
+  // nascer fora dos dois — e aí ele nasce SEM grupo, sem que nenhum teste
+  // repare. É o defeito da #1159 entrando por um arquivo que ninguém leu, com
+  // os dois testes de cima continuando verdes. Falta decidir um lado só.
+  it.each(Object.keys(PESADOS))("%s: todo job tem uma decisão de concurrency declarada", (arq) => {
+    const decididos = [...(PESADOS[arq] ?? []), ...(SEM_GRUPO[arq] ?? [])];
+    const existentes = jobsDoWorkflow(ler(arq));
+    // O job nasceu e ninguém decidiu o lado dele: sem grupo, sem reprovação.
+    expect(existentes.filter((j) => !decididos.includes(j))).toEqual([]);
+    // O recíproco: entrada nos mapas apontando para job que já não existe é
+    // silêncio pior que ausência — a lista diz que há guarda e não há.
+    expect(decididos.filter((j) => !existentes.includes(j))).toEqual([]);
+    // E os dois lados não podem se contradizer: pesado SEM grupo é o defeito
+    // aberto, agregador COM grupo é o #1190 voltando.
+    expect((PESADOS[arq] ?? []).filter((j) => (SEM_GRUPO[arq] ?? []).includes(j))).toEqual([]);
+  });
 });

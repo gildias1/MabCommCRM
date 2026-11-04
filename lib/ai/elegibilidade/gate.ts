@@ -40,6 +40,10 @@ import {
   lerNumerosDeTeste,
   numeroPodeTestar,
 } from "./pre-go-live";
+import { ehContatoInterno } from "@/lib/contacts/tags-internas";
+import { ehContatoDaEquipe } from "@/lib/contacts/tags-da-equipe";
+import { ehOperante } from "@/lib/organizacao/operante";
+import { tagsDaEquipeDaOrg, tagsInternasDaOrg } from "@/lib/schemas/settings";
 
 /** Valores aceitos em `channel_sessions.metadata.ai_gate`. */
 export const AI_GATE_MODES = ["open", "allowlist"] as const;
@@ -55,10 +59,46 @@ export function lerModoDoGate(raw: unknown): AiGateMode {
 }
 
 export interface EstadoDeElegibilidade {
+  /**
+   * `organizations.status` da conversa. Organização não operante (suspensa,
+   * redigida, arquivada ou status que ainda não existe) vence todos os vetos —
+   * a régua é única, `lib/organizacao/operante.ts`. Obrigatório de propósito:
+   * montador novo que esquecer a organização não compila.
+   */
+  orgStatus: string | null;
+  /**
+   * `channel_sessions.metadata.disabled` — canal desligado pelo operador.
+   * Veto que vale SEMPRE (mesmo com o gate aberto): desativado nunca atende.
+   */
+  canalDesativado: boolean;
   /** `channel_sessions.metadata.ai_gate` já normalizado. */
   modo: AiGateMode;
   /** `contacts.force_human` — a trava irrevogável pelo agente (regra dura 2). */
   forceHuman: boolean;
+  /**
+   * `contacts.tags` cruza com `organizations.settings.crm.internal_contact_tags`
+   * (#2353): contato marcado como interno (equipe, sócio, família, fornecedor)
+   * não recebe atendimento da IA — o mesmo veto de uma conversa em "Assumir",
+   * sem pausar uma por uma. A lista mora em `crmSettingsSchema`.
+   */
+  contatoInterno: boolean;
+  /**
+   * `contacts.tags` cruza com `organizations.settings.crm.team_contact_tags`
+   * (#3534): contato da EQUIPE que continua sendo atendido. É só um FATO,
+   * não entra em `decidirElegibilidade`: não veta e não autoriza — o contato
+   * segue a régua do canal como qualquer outro (no pré-go-live, quem autoriza
+   * é a lista de teste). Quem o lê é o medidor de clima e o handoff (sem
+   * repasse por `low_sentiment`) e o nascimento do lead. Ver
+   * `lib/contacts/tags-da-equipe.ts`.
+   */
+  contatoDaEquipe: boolean;
+  /**
+   * `contacts.ai_opt_out` — a marca PERMANENTE "sempre atendimento humano"
+   * (migration 0624 / issue 2379). Convive com `force_human` de propósito: a
+   * devolução limpa `force_human`, e esta coluna é o que ela não alcança. Vetado
+   * nos dois transportes (pg e supabase) e nos guards de envio, pela mesma regra.
+   */
+  aiOptOut: boolean;
   /** `conversations.bot_silenced_until` (ou o da conversa em questão). `'infinity'` do Postgres vira `Infinity`. */
   botSilencedUntil: Date | number | null;
   /** `conversations.assignee_kind` — `'user'` = uma pessoa é a dona do thread. */
@@ -76,10 +116,14 @@ export interface EstadoDeElegibilidade {
 }
 
 export type MotivoDeElegibilidade =
+  | "org_nao_operante"
+  | "canal_desativado"
   | "gate_aberto"
   | "force_human"
+  | "ai_opt_out"
   | "conversa_silenciada"
   | "conversa_de_humano"
+  | "contato_interno"
   | "fora_da_lista_de_teste"
   | "numero_de_teste"
   | "sem_autorizacao"
@@ -97,6 +141,17 @@ export interface DecisaoDeElegibilidade {
   bloqueioPorAllowlist: boolean;
 }
 
+/**
+ * A decisão + o fato que a régua da equipe precisa carregar (#3534).
+ *
+ * `decidirElegibilidade` continua devolvendo só `{permite, motivo, bloqueio}`
+ * — é a regra pura, e mudar o formato dela obrigaria todo consumidor a saber de
+ * equipe. Quem lê do BANCO (os dois transportes) já montou o estado, e devolve
+ * junto `contatoDaEquipe`: o medidor de clima precisa saber que a conversa é
+ * atendida (permite) E que não pode ser passada por `low_sentiment`.
+ */
+export type DecisaoDaConversa = DecisaoDeElegibilidade & { contatoDaEquipe: boolean };
+
 function silenciadoAgora(until: Date | number | null, agora: Date): boolean {
   if (until === null) return false;
   const t = typeof until === "number" ? until : until.getTime();
@@ -110,14 +165,34 @@ function silenciadoAgora(until: Date | number | null, agora: Date): boolean {
  * autorização positiva.
  */
 export function decidirElegibilidade(e: EstadoDeElegibilidade): DecisaoDeElegibilidade {
+  if (!ehOperante(e.orgStatus)) {
+    return { permite: false, motivo: "org_nao_operante", bloqueioPorAllowlist: false };
+  }
+  if (e.canalDesativado) {
+    return { permite: false, motivo: "canal_desativado", bloqueioPorAllowlist: false };
+  }
   if (e.forceHuman) {
     return { permite: false, motivo: "force_human", bloqueioPorAllowlist: false };
+  }
+  // A marca PERMANENTE (issue 2379): mesmo com `force_human` já limpo pela
+  // devolução, o contato segue vetado — motivo próprio para o rastro de quem
+  // investiga por que a IA não respondeu ("force_human" diria que há uma
+  // passagem humana em andamento, e não é isso).
+  if (e.aiOptOut) {
+    return { permite: false, motivo: "ai_opt_out", bloqueioPorAllowlist: false };
   }
   if (silenciadoAgora(e.botSilencedUntil, e.agora)) {
     return { permite: false, motivo: "conversa_silenciada", bloqueioPorAllowlist: false };
   }
   if (e.assigneeKind === "user") {
     return { permite: false, motivo: "conversa_de_humano", bloqueioPorAllowlist: false };
+  }
+  // #2353: contato marcado como interno não é atendido pela IA em canal nenhum —
+  // é veto de CONTATO, no mesmo lugar dos outros vetos que valem sempre, e não
+  // uma exigência positiva de gate. Vale igual com o gate aberto: quem ligou o
+  // robô no número não quer que ele responda a equipe, sócio ou família.
+  if (e.contatoInterno) {
+    return { permite: false, motivo: "contato_interno", bloqueioPorAllowlist: false };
   }
 
   if (e.modo === "open") {
@@ -179,10 +254,24 @@ export function normalizarInstante(v: Date | string | number | null | undefined)
  */
 export function montarEstadoDeElegibilidade(raw: {
   aiGate: unknown;
+  /** `organizations.status`; obrigatório como CHAVE — quem monta tem de dizer de onde leu. */
+  orgStatus: string | null | undefined;
+  /** `channel_sessions.metadata.disabled` (cru); só `true` desliga. */
+  canalDesativado?: unknown;
   aiGateMode?: unknown;
   aiTestPhoneNumbers?: unknown;
   contactPhoneNumber?: string | null;
   forceHuman: unknown;
+  /** `contacts.tags` cru (array de `text[]`), para a régua de contato interno (#2353). */
+  contactTags?: readonly string[] | null | undefined;
+  /** `organizations.settings` cru; a lista interna mora em `.crm.internal_contact_tags`. */
+  orgSettings?: unknown;
+  /**
+   * `contacts.ai_opt_out` (cru). Obrigatório de propósito, igual a `forceHuman`:
+   * quem monta tem de dizer de onde leu, e um transporte novo que esqueça a
+   * coluna falha no typecompile em vez de virar uma devolução em verde.
+   */
+  aiOptOut: unknown;
   assigneeKind: string | null;
   botSilencedUntil: Date | string | number | null | undefined;
   aiAuthorizedAt: Date | string | null | undefined;
@@ -194,8 +283,13 @@ export function montarEstadoDeElegibilidade(raw: {
   const preGoLive = modo === "allowlist" && raw.aiGateMode === AI_GATE_PRE_GO_LIVE;
   const numerosDeTeste = lerNumerosDeTeste({ ai_test_phone_numbers: raw.aiTestPhoneNumbers });
   return {
+    orgStatus: raw.orgStatus ?? null,
+    canalDesativado: raw.canalDesativado === true,
     modo,
     forceHuman: raw.forceHuman === true,
+    contatoInterno: ehContatoInterno(raw.contactTags, tagsInternasDaOrg(raw.orgSettings)),
+    contatoDaEquipe: ehContatoDaEquipe(raw.contactTags, tagsDaEquipeDaOrg(raw.orgSettings)),
+    aiOptOut: raw.aiOptOut === true,
     botSilencedUntil: normalizarInstante(raw.botSilencedUntil),
     assigneeKind: raw.assigneeKind,
     aiAuthorizedAt: autorizadoEm instanceof Date ? autorizadoEm : null,

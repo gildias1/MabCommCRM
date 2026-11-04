@@ -15,8 +15,18 @@
  * é lido por uma pessoa na tela, e o push vai só para o RESPONSÁVEL. É a
  * diferença que a issue pede — advocacia, saúde e serviços regulados precisam
  * que o sistema LEMBRE a equipe e não que o sistema fale.
+ *
+ * ═══ O BANCO VEM PELA PORTA (#3715) ═══
+ *
+ * As três consultas (negócio, contato, INSERT da tarefa) deixaram de ser a
+ * cadeia do PostgREST e são SQL com parâmetros em `lib/db`. Quem chama passa a
+ * PORTA (`portaDaAplicacao()`), não mais o cliente do SDK: aceitar os dois
+ * seria aceitar um cliente que a função ignora — e o chamador acharia que a
+ * escrita foi por ele. Os quatro chamadores (as duas ações de automação, o nó
+ * `internal_task` do follow-up e o aviso de carteira) foram adaptados junto.
+ * A organização é filtro de SQL em toda leitura: o pool não passa por RLS.
  */
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Db } from "@/lib/db";
 
 import { audit } from "@/lib/audit";
 import { logger } from "@/lib/logger";
@@ -24,7 +34,7 @@ import { nomeDoContato } from "@/lib/contacts/rotulo-do-contato";
 import { truncar } from "@/lib/notifications/push_payload";
 import { enviarPushAoUsuario } from "@/lib/notifications/web_push";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
-import { PRIORIDADES_DA_TAREFA, type PrioridadeDaTarefa } from "@/lib/tarefas/tipos";
+import { HREF_MINHAS_TAREFAS, PRIORIDADES_DA_TAREFA, type PrioridadeDaTarefa } from "@/lib/tarefas/tipos";
 
 /**
  * Quem fica com a tarefa: o dono do negócio, ou uma pessoa escolhida na regra.
@@ -55,14 +65,14 @@ export type ResultadoDaTarefa =
   | { ok: true; tarefa_id: string; assigned_to: string | null }
   | { ok: false; codigo: "sem_alvo" | "sem_dono" | "titulo_vazio" | "falha"; erro?: string };
 
-type LeadDoPedido = {
+export type LeadDoPedido = {
   id: string;
   title?: string | null;
   contact_id?: string | null;
   owner_user_id?: string | null;
 };
 
-type ContatoDoPedido = {
+export type ContatoDoPedido = {
   id: string;
   name?: string | null;
   display_name?: string | null;
@@ -95,6 +105,58 @@ export function interpolarTitulo(
 }
 
 /**
+ * A recusa de CONFIGURAÇÃO de UM passo — sem escrever nada.
+ *
+ * Esta função É a regra `sem_dono`/`titulo_vazio`, num sítio só: quem chama
+ * duas vezes com a mesma entrada tem de recusar do mesmo jeito. O portão novo
+ * é o do plano (`lib/tarefas/plano.ts`), que confere TODOS os passos antes do
+ * primeiro INSERT; sem esta função, a validação do plano seria uma cópia das
+ * linhas abaixo e as duas divergiriam no primeiro ajuste — os dois "validam o
+ * mesmo passo", só que um deixa passar o que o outro recusa.
+ *
+ * `sem_alvo` NÃO é daqui: ele depende de não haver lead nem contato, que é uma
+ * pergunta do pedido, não do passo.
+ */
+export function recusaDeConfiguracao(
+  atribuirA: AtribuicaoDaTarefa,
+  titulo: string,
+  valores: { lead?: LeadDoPedido | null; contact?: ContatoDoPedido | null },
+): "sem_dono" | "titulo_vazio" | null {
+  const atribuido =
+    typeof atribuirA === "object" ? atribuirA.usuario_id : (valores.lead?.owner_user_id ?? null);
+  if (!atribuido) return "sem_dono";
+  if (!interpolarTitulo(titulo, valores)) return "titulo_vazio";
+  return null;
+}
+
+/**
+ * Leitura de UMA linha que já tolerava erro — e continua tolerando.
+ *
+ * Com o PostgREST, `.maybeSingle()` devolvia `{ data: null, error }` e este
+ * módulo olhava só `data`: um erro de leitura virava "não achei", e a recusa
+ * saía como `sem_alvo` (configuração) e não como `falha` (infra). Preservar
+ * isso é preservar o contrato visível de quem chama — inclusive o desfecho
+ * FECHADO (nunca cria tarefa com um alvo que não conseguiu ler). Distinguir os
+ * dois casos é decisão de produto, não de migração.
+ */
+async function lerLinha<T>(
+  db: Db,
+  sql: string,
+  parametros: readonly unknown[],
+): Promise<T | null> {
+  try {
+    return await db.queryOne<T>(sql, parametros);
+  } catch {
+    return null;
+  }
+}
+
+/** Mensagem crua do driver, sem SQL montado — é o que vira `erro` no resultado. */
+function mensagemDoErro(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
  * Grava a tarefa, audita, registra na linha do tempo do negócio e (se houver
  * responsável) manda o push.
  *
@@ -107,73 +169,82 @@ export function interpolarTitulo(
  * lista de tarefas sem responsável vira ruído que ensina o time a ignorar.
  */
 export async function criarTarefaInterna(
-  db: SupabaseClient,
+  db: Db,
   pedido: PedidoDeTarefa,
 ): Promise<ResultadoDaTarefa> {
   const agora = pedido.agora ?? new Date();
+
   const lead = pedido.leadId
-    ? ((
-        await db
-          .from("crm_leads")
-          .select("id, title, contact_id, owner_user_id")
-          .eq("id", pedido.leadId)
-          .eq("organization_id", pedido.organizationId)
-          .maybeSingle()
-      ).data as LeadDoPedido | null)
+    ? await lerLinha<LeadDoPedido>(
+        db,
+        `select id, title, contact_id, owner_user_id
+           from crm_leads
+          where id = $1
+            and organization_id = $2
+          limit 1`,
+        [pedido.leadId, pedido.organizationId],
+      )
     : null;
 
   const contactId = pedido.contactId ?? lead?.contact_id ?? null;
   const contact = contactId
-    ? ((
-        await db
-          .from("contacts")
-          .select("id, name, display_name")
-          .eq("id", contactId)
-          .eq("organization_id", pedido.organizationId)
-          .maybeSingle()
-      ).data as ContatoDoPedido | null)
+    ? await lerLinha<ContatoDoPedido>(
+        db,
+        `select id, name, display_name
+           from contacts
+          where id = $1
+            and organization_id = $2
+          limit 1`,
+        [contactId, pedido.organizationId],
+      )
     : null;
 
   if (!lead && !contact) {
     return { ok: false, codigo: "sem_alvo" };
   }
 
+  const recusa = recusaDeConfiguracao(pedido.atribuirA, pedido.titulo, { lead, contact });
+  if (recusa) return { ok: false, codigo: recusa };
+
   const assignedTo =
     typeof pedido.atribuirA === "object" ? pedido.atribuirA.usuario_id : (lead?.owner_user_id ?? null);
-  if (typeof pedido.atribuirA === "object" && !assignedTo) {
-    return { ok: false, codigo: "sem_dono" };
-  }
-  if (typeof pedido.atribuirA === "string" && !assignedTo) {
-    return { ok: false, codigo: "sem_dono" };
-  }
-
   const titulo = interpolarTitulo(pedido.titulo, { lead, contact });
-  if (!titulo) return { ok: false, codigo: "titulo_vazio" };
 
   const dueDate = new Date(agora.getTime() + pedido.venceEmDias * 86_400_000).toISOString();
 
-  const { data: criada, error } = await db
-    .from("crm_tasks")
-    .insert({
-      organization_id: pedido.organizationId,
-      title: titulo,
-      description: pedido.descricao ?? null,
-      due_date: dueDate,
-      priority: pedido.prioridade,
-      status: "pending",
-      lead_id: lead?.id ?? null,
-      contact_id: contactId,
-      assigned_to: assignedTo,
-      created_by: null,
-    })
-    .select("id")
-    .maybeSingle();
+  // INSERT … RETURNING id: o `.insert().select("id").maybeSingle()` do
+  // PostgREST devolvia a linha criada numa segunda ida (Prefer: return=
+  // representation); aqui o id vem na MESMA ida.
+  let tarefaId: string;
+  try {
+    const criadas = await db.query<{ id: string }>(
+      `insert into crm_tasks
+         (organization_id, title, description, due_date, priority, status,
+          lead_id, contact_id, assigned_to, created_by)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       returning id`,
+      [
+        pedido.organizationId,
+        titulo,
+        pedido.descricao ?? null,
+        dueDate,
+        pedido.prioridade,
+        "pending",
+        lead?.id ?? null,
+        contactId,
+        assignedTo,
+        null,
+      ],
+    );
 
-  if (error || !criada) {
-    return { ok: false, codigo: "falha", erro: error?.message };
+    // `RETURNING id` devolve exatamente a linha inserida; se o driver não
+    // devolveu nada, o INSERT não aconteceu — e isso é `falha`, nunca `ok`.
+    const criada = criadas[0];
+    if (!criada) return { ok: false, codigo: "falha" };
+    tarefaId = criada.id;
+  } catch (err) {
+    return { ok: false, codigo: "falha", erro: mensagemDoErro(err) };
   }
-
-  const tarefaId = criada.id as string;
 
   // Fire-and-forget quanto a erro: perder o audit ou o push não pode desfazer a
   // tarefa que já existe (lei do CLAUDE.md §Audit log — mesma razão dos crons
@@ -221,7 +292,7 @@ export async function criarTarefaInterna(
         title: "Nova tarefa",
         body: truncar(titulo),
         tag: `task:${tarefaId}`,
-        href: "/app/tasks",
+        href: HREF_MINHAS_TAREFAS,
       });
     } catch (err) {
       logger.warn("task_push_failed", {

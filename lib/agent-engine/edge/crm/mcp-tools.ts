@@ -19,6 +19,8 @@ import { claimOfJob } from '@/lib/agent-engine/queue/claim';
  */
 import type { Tool } from 'ai';
 
+import { carregarServidorMcpExternoDoTurno } from '@/lib/mcp/servidor-externo/carregar';
+import { carregarServidoresDoAgenteNoTurno } from '@/lib/mcp/servidor-externo/do-agente/carregar';
 import { pickToolsFromMcp, type RuntimeHandoffSignal } from '@/lib/ai/runtime/tools';
 import { mintEphemeralToken, revokeEphemeralToken } from '@/lib/ai/runtime/mcp_token';
 import { IDS_DO_HARNESS, motivoDoHarness } from '@/lib/mcp/tools/ferramentas-do-harness';
@@ -31,6 +33,7 @@ import { filtrarToolsComCallbackDesabilitado } from '@/lib/followup/callback-pol
 import type { Logger } from '../../obs/logger';
 import type { CrmEdgeConfig } from './mcp-client';
 import type { PublishedAgentConfig } from '../../agent/agent-config';
+import type { EfeitoDasEscrituras } from '@/lib/ai/runtime/efeito-das-escritas';
 
 /**
  * Tools do catálogo que jamais entram num turno do engine (ver doc acima).
@@ -56,11 +59,32 @@ export interface McpTurnTools {
 
 export async function buildMcpTurnTools(
   cfg: CrmEdgeConfig,
-  /** `contactId`: o contato do turno — ver `contatoDoTurno` em `lib/ai/runtime/tools.ts`. */
-  ids: { organizationId: string; jobId: string; contactId?: string },
+  /**
+   * `contactId`: o contato do turno — ver `contatoDoTurno` em `lib/ai/runtime/tools.ts`.
+   * Obrigatório de propósito: `null` só onde não há cliente (o ensaio do agente);
+   * omiti-lo num turno de conversa abriria as leituras escopadas por ele.
+   */
+  ids: {
+    organizationId: string;
+    jobId: string;
+    contactId: string | null;
+    /** A conversa do turno — o canal que o servidor MCP externo recebe (#2147). */
+    conversationId?: string | null;
+  },
   agentConfig: PublishedAgentConfig,
   log: Logger,
-  options?: { readOnly: boolean },
+  options?: {
+    readOnly: boolean;
+    /**
+     * O PREDICADO ÚNICO do efeito do turno (#3333): esta função é quem alimenta, porque é
+     * a ponte que executa a escrita e decide o desfecho. Quem lê é o gate
+     * `registro_sem_efeito` — o turno passa o MESMO coletor para os dois lados.
+     *
+     * Ausente = ninguém pergunta (operador, chamador antigo): nenhum desfecho é registrado,
+     * e o gate fica desarmado. Nunca o contrário.
+     */
+    efeitos?: EfeitoDasEscrituras;
+  },
 ): Promise<McpTurnTools | null> {
   const callbackFiltered = filtrarToolsComCallbackDesabilitado(
     agentConfig.toolIds,
@@ -126,6 +150,43 @@ export async function buildMcpTurnTools(
   // O engine não usa o sinal de handoff da ponte (a tool está bloqueada) — dummy.
   const handoffSignal: RuntimeHandoffSignal = { triggered: false };
 
+  // #2147 — servidor MCP externo registrado pela instalação. `null` SEM REDE
+  // quando o agente não escolheu nenhuma remota (item 7) ou quando
+  // `ids.contactId` está presente, turno de conversa, sem a opção
+  // `mcp_externo_no_atendimento` do agente (item 8, escolha (b)). Ligada, o
+  // servidor recebe a identidade do contato em cabeçalho (ver `carregar.ts`).
+  const servidorExterno = await carregarServidorMcpExternoDoTurno(
+    cfg.supabase,
+    ids.organizationId,
+    allowed,
+    {
+      ...(ids.contactId
+        ? {
+            contatoDoTurno: ids.contactId,
+            ...(agentConfig.mcpExternoNoAtendimento === true
+              ? {
+                  noAtendimento: true,
+                  ...(ids.conversationId ? { conversaDoTurno: ids.conversationId } : {}),
+                }
+              : {}),
+          }
+        : {}),
+    },
+  );
+
+  // Servidores MCP DO AGENTE (migration 9095) — mesma carga do runtime nativo.
+  const servidoresDoAgente = await carregarServidoresDoAgenteNoTurno(
+    cfg.supabase,
+    ids.organizationId,
+    agentConfig.agentId,
+    allowed,
+    {
+      ...(ids.contactId ? { contatoDoTurno: ids.contactId } : {}),
+      ...(ids.conversationId ? { conversaDoTurno: ids.conversationId } : {}),
+      ...(agentConfig.mcpExternoNoAtendimento === true ? { noAtendimento: true } : {}),
+    },
+  );
+
   const tools = pickToolsFromMcp({
     supabase: cfg.supabase,
     ctx,
@@ -143,6 +204,9 @@ export async function buildMcpTurnTools(
     modulosLigados: await modulosLigados(cfg.supabase),
     capacidadesLigadas: await capacidadesDaOrganizacao(cfg.supabase, ids.organizationId),
     ...(ids.contactId ? { contatoDoTurno: ids.contactId } : {}),
+    ...(servidorExterno ? { servidorMcpExterno: servidorExterno } : {}),
+    ...(servidoresDoAgente.length > 0 ? { servidoresDoAgente } : {}),
+    ...(options?.efeitos ? { efeitos: options.efeitos } : {}),
   });
 
   return {
@@ -152,7 +216,7 @@ export async function buildMcpTurnTools(
     // pelo TTL curto do mint (mesmo tradeoff aceito pelo runtime nativo no grace).
     cleanup: async () => {
       try {
-        await revokeEphemeralToken(ephemeral.id);
+        await revokeEphemeralToken(ephemeral.id, ids.organizationId);
       } catch {
         // token expira sozinho; revogação é higiene, não invariante.
       }
